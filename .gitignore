@@ -82,3 +82,6 @@ Thumbs.db
 # flamingo-log.cmd output (holds paths of the PC it ran on)
 /logs/
 /flamingo-game.txt
+
+# Your own run.sh settings (paths to your files)
+/scripts/linux/play.local.env

@@ -91,14 +91,22 @@ archives are found relative to it, so an executable moved on its own does not st
 dump inside this repository (the asset policy; the tools refuse to write game-derived output under
 it).
 
-Run it with the settings Flamingo is tuned with on an RTX 4070, plus the ambient light:
+The settings Flamingo is tuned with on an RTX 4070, plus the ambient light and
+`--console series-s`, are in `scripts/linux/play.env`; `run.sh` reads it for `play` and
+`prebuild`. Put the executable's path in `scripts/linux/play.local.env` (git-ignored, for your
+own paths and changes) once:
 
 ```sh
-VICTORY_NO_WATCHDOG=1 VICTORY_PIPELINE_WAIT_MS=24 VICTORY_RELAY=1 VICTORY_LATE_WAIT=3 \
-VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024 VICTORY_INDIRECT_WINDOW=1 \
-VICTORY_SHADER_OPT=0 VICTORY_WIDE_MERGE=1 FLAMINGO_OSD=1 VICTORY_AMBIENT=0.6 \
-  scripts/linux/run.sh play "$HOME/Games/<the title>/<the title's exe>" --console series-s
+echo 'FORK_GAME=~/Games/<the title>/<the title'"'"'s exe>' > scripts/linux/play.local.env
+scripts/linux/run.sh settings     # what a run would use (nothing is started)
+scripts/linux/run.sh prebuild     # once: translates every shader (shaders.rpf beside FORK_GAME)
+scripts/linux/run.sh play
 ```
+
+A variable set on the command line wins over both files for that run
+(`VICTORY_RELAY=2 scripts/linux/run.sh play`), and a path or options after `play` replace
+`FORK_GAME` or the default options. Every log starts with what it ran with: the source commit,
+Proton and vkd3d-proton, the NVIDIA driver, and each setting with where it came from.
 
 - **`--console series-s`**: renders at 1280×720 and upscales with the title's own upscaler, and
   commits less memory. Pass it: vkd3d-proton gives the title about 10.5 of the card's 12 GB, and
