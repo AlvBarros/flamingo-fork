@@ -9,6 +9,8 @@
 
 # Build output
 /target/
+# Run logs (scripts/linux/run.sh); a play log can hold game-derived data: never commit.
+/logs/
 /tests/fixtures/*/target/
 
 # Local configuration (contains paths to YOUR files)
