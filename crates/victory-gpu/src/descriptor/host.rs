@@ -2930,7 +2930,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     let words: Option<[u32; 10]> = desc[..10].try_into().ok();
                     return make(&View::Unordered(texture as usize, 0, words), at);
                 }
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                once!(
+                    dimension = resource[0],
+                    address = format_args!("{address:#x}"),
+                    unordered,
+                    resource = format_args!("{resource:x?}"),
+                    "placed unordered texture view not mirrored"
+                );
                 return None;
             }
             // The resource description's width, after the alignment.
