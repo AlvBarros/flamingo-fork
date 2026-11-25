@@ -2472,6 +2472,26 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .is_some_and(|end| end <= width)
 }
 
+/// Flamingo: for a raw view whose first byte in its host copy is not on 16
+/// bytes (the host refuses those, and the slot read zeros: the title's
+/// structured views of 4 MiB windows start where their data does, as at byte
+/// 8, 12 views a frame in the world), a copy of the view's own bytes
+/// ([`crate::shadow::exact`]) that the view takes from element 0. `copy_start`:
+/// the title address of the host copy's byte 0. `None`: the view stays.
+fn raw_on_own_bytes(raw: bool, first: u64, count: u32, copy_start: u64) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    // Opt-in (`VICTORY_RAW_OWN_COPY=1`): with it no view was left null, but
+    // nothing changed in the picture and the frame rate went from about 10.5
+    // to 7.5-8.7 (runs 133, 136, 138: a copy made anew every frame).
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_RAW_OWN_COPY").is_some_and(|v| v == "1")) {
+        return None;
+    }
+    if !raw || first.is_multiple_of(4) || count == 0 {
+        return None;
+    }
+    crate::shadow::exact(copy_start + first * 4, u64::from(count) * 4)
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -2527,6 +2547,13 @@ fn buffer_srv(
     }
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+    let (shadow, first) = match raw_on_own_bytes(raw, first, count, address - offset) {
+        Some(own) => {
+            buffer.FirstElement = 0;
+            (own, 0)
+        }
+        None => (shadow, first),
+    };
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
@@ -2630,6 +2657,13 @@ fn buffer_uav(
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
     }
+    let (shadow, first) = match raw_on_own_bytes(raw, first, count, address - offset) {
+        Some(own) => {
+            desc.Anonymous.Buffer.FirstElement = 0;
+            (own, 0)
+        }
+        None => (shadow, first),
+    };
     // SAFETY: a live buffer.
     let width = unsafe { shadow.buffer.GetDesc() }.Width;
     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
