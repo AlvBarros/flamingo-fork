@@ -388,11 +388,29 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         let first = description
             .as_ref()
             .and_then(|w| words(w[0] as usize));
+        // Flamingo: what each of the description's first twelve words
+        // points at, where it is readable memory: its first 32 bytes, as
+        // text where they are text (a container begins "DXBC").
+        let pointed: Vec<String> = description
+            .iter()
+            .flatten()
+            .take(12)
+            .map(|&w| match words(w as usize) {
+                Some(v) => {
+                    let bytes: Vec<u8> = v.iter().take(4).flat_map(|x| x.to_le_bytes()).collect();
+                    let text: String =
+                        bytes.iter().map(|&b| if b.is_ascii_graphic() { b as char } else { '.' }).collect();
+                    format!("{w:x}->{:x?} '{text}'", &v[..4])
+                }
+                None => format!("{w:x}"),
+            })
+            .collect();
         tracing::warn!(
             slot = format_args!("{:#x}", SLOT),
             calls,
             description = format_args!("{description:x?}"),
             first_points_at = format_args!("{first:x?}"),
+            pointed = format_args!("{pointed:?}"),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }

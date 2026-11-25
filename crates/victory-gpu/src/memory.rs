@@ -57,6 +57,8 @@ use crate::shadow::Shadow;
 /// Copies that can be numbered (the run of heap slots is one longer). A
 /// listed frame of the opening cutscene names about 50 windows.
 const COPIES: u32 = 1023;
+/// Frames before a retired copy's place is given to another copy.
+const REUSE_FRAMES: u64 = 4;
 /// A window of memory outside buffers (`shadow.rs`).
 const CELL: u64 = 4 << 20;
 /// A directory page.
@@ -68,9 +70,22 @@ struct Memory {
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
+    /// Flamingo: per copy, whether it is still the copy of its memory
+    /// ([`Memory::forget_stale`]); a copy that is not keeps its place, and
+    /// its view, until its number is given out again.
+    live: Vec<bool>,
+    /// Flamingo: per copy's place, how many copies it has had (a heap's
+    /// view of the place is made again when it changed).
+    generation: Vec<u32>,
+    /// Flamingo: places whose copy stopped being its memory's, and the
+    /// frame it did: given out again [`REUSE_FRAMES`] frames later, when no
+    /// list in the air uses the old copy's view.
+    free: std::collections::VecDeque<(usize, u64)>,
+    /// Flamingo: places given a copy since [`ready`] last looked.
+    assigned: Vec<usize>,
+    /// Per host view heap (by address): the first slot of its run, and per
+    /// copy's place the generation of the view there (0: none yet).
+    heaps: HashMap<usize, (u32, Vec<u32>)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -108,6 +123,10 @@ impl Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
+            live: Vec::new(),
+            generation: Vec::new(),
+            free: Default::default(),
+            assigned: Vec::new(),
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -152,11 +171,30 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
+        let reusable = self
+            .free
+            .front()
+            .filter(|&&(_, at)| self.frame >= at + REUSE_FRAMES)
+            .map(|&(n, _)| n);
+        let n = match self.copies.iter().zip(&self.live).position(|(c, &live)| live && Arc::ptr_eq(c, &shadow)) {
             Some(n) => n,
-            None if self.copies.len() < COPIES as usize => {
-                self.copies.push(shadow.clone());
-                let n = self.copies.len() - 1;
+            None if reusable.is_some() || self.copies.len() < COPIES as usize => {
+                let n = match reusable {
+                    Some(n) => {
+                        self.free.pop_front();
+                        self.copies[n] = shadow.clone();
+                        n
+                    }
+                    None => {
+                        self.copies.push(shadow.clone());
+                        self.live.push(false);
+                        self.generation.push(0);
+                        self.copies.len() - 1
+                    }
+                };
+                self.live[n] = true;
+                self.generation[n] += 1;
+                self.assigned.push(n);
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
                 // shortcut: a page of a title buffer inside this one that
@@ -191,6 +229,40 @@ impl Memory {
         unsafe {
             entry.add(1).write_volatile(offset as u32);
             entry.write_volatile(n as u32 + 1);
+        }
+    }
+
+    /// Flamingo: copies that are no longer the copy of their memory (the
+    /// title made another buffer there, or the memory was taken out of the
+    /// tables) are retired: their directory entries are emptied, so the next
+    /// touch faults and maps the copy that holds the memory now, they are
+    /// neither brought up to date nor written back any more, and their place
+    /// is given out again later. They stayed numbered for the rest of the
+    /// run: run 116 ran out of numbers (1023), and what shaders stored
+    /// through such a copy was written back over the memory's new contents.
+    fn forget_stale(&mut self) {
+        for n in 0..self.copies.len() {
+            if !self.live[n] {
+                continue;
+            }
+            let (first, len) = self.copies[n].span();
+            if crate::shadow::find(first, 1).is_some_and(|c| Arc::ptr_eq(&c, &self.copies[n])) {
+                continue;
+            }
+            self.live[n] = false;
+            self.free.push_back((n, self.frame));
+            let last = ((first + len.max(1) - 1) / PAGE).min(u64::from(MEMORY_PAGES) - 2);
+            for page in first / PAGE..=last {
+                // SAFETY: inside the directory's mapping.
+                let entry = unsafe { self.directory.1.add(page as usize * 2) };
+                // SAFETY: as above; a shader that reads the number 0 reads
+                // no offset.
+                unsafe {
+                    if entry.read_volatile() == n as u32 + 1 {
+                        entry.write_volatile(0);
+                    }
+                }
+            }
         }
     }
 
@@ -255,9 +327,9 @@ pub(crate) fn ready(
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
+        m.forget_stale();
         m.take_faults();
     }
-    let numbered = m.copies.len();
     for &address in addresses {
         m.name(address);
     }
@@ -276,20 +348,25 @@ pub(crate) fn ready(
         }
     }
     let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
+    let (base, mut shown) = match m.heaps.remove(&key) {
+        Some(run) => run,
         None => {
             // Held for the heap's life: not given back with a list's slots.
             let base = heap.dynamic(COPIES + 1)?;
             heap.null_raw_uav_at(base);
-            (base, 0)
+            (base, Vec::new())
         }
     };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+    shown.resize(m.copies.len(), 0);
+    for (n, shadow) in m.copies.iter().enumerate() {
+        if shown[n] != m.generation[n] {
+            let (_, len) = shadow.span();
+            heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+            shown[n] = m.generation[n];
+        }
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
+    m.heaps.insert(key, (base, shown));
+    let assigned = std::mem::take(&mut m.assigned);
     // Once per list, and for copies numbered since: the builder alone
     // dispatches hundreds of times a frame.
     // shortcut: a copy another list numbers meanwhile is brought up to date
@@ -299,11 +376,16 @@ pub(crate) fn ready(
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
     for (n, shadow) in m.copies.iter().enumerate() {
+        // A retired copy is not its memory's any more.
+        if !m.live[n] {
+            continue;
+        }
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
+        let new = assigned.contains(&n);
+        if first_read || new {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        if writes && (first_write || new) {
             shadow.gpu_writes(list, start, len);
         }
     }

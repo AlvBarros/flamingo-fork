@@ -2123,6 +2123,46 @@ impl Deferred {
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
+
+    /// Empties the recording for the list's next use, keeping the capacity
+    /// of every collection (a reset is per submission, and the sets and
+    /// vectors grow back the same way every time). The same state
+    /// [`Deferred::default`] gives, so nothing leaks across resets: the
+    /// held uploads pass out of [`ALIVE`] as they would when dropped.
+    fn clear(&mut self) {
+        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        // Every field by name (no `..`): one added later must be cleared
+        // here too. Flamingo's texture copy-backs were not, so every list
+        // reset kept them and the next submission did them all again (run
+        // 120: 119 ms a frame waiting for the card).
+        let Deferred {
+            copies,
+            uploads,
+            upload_bytes,
+            kept,
+            refreshed,
+            textures,
+            writes,
+            backs,
+            back_wanted,
+            texture_backs,
+            budget_zeroed,
+            indirect_readable,
+        } = self;
+        copies.clear();
+        uploads.clear();
+        *upload_bytes = 0;
+        kept.clear();
+        refreshed.clear();
+        textures.clear();
+        writes.clear();
+        backs.clear();
+        back_wanted.clear();
+        texture_backs.clear();
+        *budget_zeroed = false;
+        *indirect_readable = 0;
+    }
 }
 
 impl Drop for Deferred {
@@ -6325,7 +6365,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7838,6 +7878,17 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
         return true;
     }
     let mut done = 0;
+    if direct_writes() {
+        // SAFETY: the destination is mapped writable memory of `len` bytes;
+        // the kernel checks the source. A short or partial read returns a
+        // negative status (`STATUS_PARTIAL_COPY`), which leaves the piece
+        // walk in `read_pieces` to zero what cannot be read; `done == len`
+        // keeps that true of a success that is somehow short.
+        let status = unsafe {
+            NtReadVirtualMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done)
+        };
+        return status >= 0 && done == len;
+    }
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
@@ -7855,6 +7906,18 @@ unsafe extern "system" {
         size: usize,
         written: *mut usize,
     ) -> i32;
+
+    /// The kernel's read from a process's memory, `(process, address,
+    /// bytes, length, read out)`: an NTSTATUS, negative when a page of the
+    /// range is not there or not readable (`STATUS_PARTIAL_COPY` when only
+    /// part of it is). It changes no protection.
+    fn NtReadVirtualMemory(
+        process: *mut std::ffi::c_void,
+        base: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: usize,
+        read: *mut usize,
+    ) -> i32;
 }
 
 /// Whether title memory is written with the kernel's own call
@@ -7862,7 +7925,9 @@ unsafe extern "system" {
 /// what the pages are (as `VirtualQuery` does: about 2 ms a call in the
 /// title's big pools, see [`copy_mapped`]): putting back what shaders wrote
 /// cost 1.2-1.9 s a frame for 430-800 pieces, 2 ms each whatever their size
-/// (run 24). On by default; `VICTORY_DIRECT_WRITES=0` writes as before.
+/// (run 24). The same switch reads with `NtReadVirtualMemory`, as
+/// `ReadProcessMemory` asks the same question. On by default;
+/// `VICTORY_DIRECT_WRITES=0` writes and reads as before.
 fn direct_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))
@@ -8293,6 +8358,7 @@ impl Meter {
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
+        crate::fpsbox::set(fps);
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
@@ -8686,6 +8752,9 @@ impl Host {
                 ),
             ]);
             list.CopyResource(&back, texture);
+            // The frame rate, into the corner of what is shown (not of the
+            // title's own frame, which the lines below read back).
+            crate::fpsbox::draw(self, list, &back, (width, height, format));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
