@@ -63,6 +63,14 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            // `VICTORY_SKIP_PIPELINES`: never handed to the host driver,
+            // whichever path asks (a draw, a worker, the early start).
+            let skip = super::skip_hashes();
+            if let Some(s) = self.shaders.iter().find(|s| skip.contains(&s.hash)) {
+                tracing::warn!(stage = s.stage, hash = %s.hash, "host pipeline not made: VICTORY_SKIP_PIPELINES");
+                MADE[1].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             // Flamingo: for the stats overlay.
             MADE[usize::from(made.is_none())].fetch_add(1, Ordering::Relaxed);

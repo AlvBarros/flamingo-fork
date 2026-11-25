@@ -39,8 +39,8 @@ fork_compiler
 fork_overrides
 export VICTORY_CACHE_DIR="$(winpath "$FORK_HOME/cache")"
 export VICTORY_DATA_DIR="$(winpath "$FORK_HOME/data")"
-# The built-in skip list holds a shader that hangs the AMD compiler only;
-# on other cards nothing is skipped unless VICTORY_SKIP_PIPELINES is set.
+# VICTORY_SKIP_PIPELINES=<hash>,...: pipelines with these shaders are never
+# compiled (for a shader the driver crashes on); empty by default.
 export VICTORY_SKIP_PIPELINES="${VICTORY_SKIP_PIPELINES-}"
 LOG="$LOGS/$(date +%Y%m%d-%H%M%S)-${1:-run}.log"
 
