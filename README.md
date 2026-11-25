@@ -31,8 +31,21 @@ measured on Windows 11.
 | Build on Linux | ✅ `scripts/linux/build.sh` |
 | Direct3D 12 device under Proton | ✅ `scripts/linux/run.sh check` (SM 6.8, mesh shaders, DXR 1.1 through vkd3d-proton) |
 | Pipeline cache kept between runs under vkd3d-proton | ✅ null-blob empty library (gmankab, from KLBF Lab / VIctory#347) |
-| Test suite under Proton | ✅ 739 of 744 (`scripts/linux/test.sh`); the 5 left are Wine's: no event-log subscription (driver watch), vkd3d-proton accepts unsigned DXIL, `cargo`/`git` started inside Wine, `ws2_32` lacks `WSAConnectByList` |
+| Test suite under Proton | ✅ 744 of 749 (`scripts/linux/test.sh`); the 5 left are Wine's: no event-log subscription (driver watch), vkd3d-proton accepts unsigned DXIL, `cargo`/`git` started inside Wine, `ws2_32` lacks `WSAConnectByList` |
 | In game | ⏳ not run yet |
+
+Brought in from other forks (each with a test that runs on the RTX 4070 under Proton):
+
+- **Helper lanes:** a helper lane's `v_readfirstlane` takes its own value (upstream VIctory
+  0601955 via Belobug f520772), with dexnom's quad-broadcast test. Flamingo's quad-read change
+  stays opt-in (`FLAMINGO_QUAD_HELPERS=1`): the test passes without it on this card.
+- **Less CPU work per list** (Belobug, romainhedouin's PRs #24, #25, #29, #30): shader-written
+  ranges declared once and grouped by hash; one fill per misaligned root constant buffer; one
+  keep per pipeline; texture staging from the list's scratch chunks.
+
+Settings worth knowing here: `VICTORY_AMBIENT=0.6` turns on the constant ambient light (off by
+default in Flamingo; it stands in for the missing ray-traced indirect light, which leaves shadows
+black and foliage magenta).
 
 Facts found on this machine that matter under Proton:
 
