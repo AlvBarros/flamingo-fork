@@ -7,7 +7,8 @@
 #
 # Settings (environment):
 #   PROTON_DIR   Proton install (default: Steam's "Proton 11.0")
-#   FORK_HOME    prefix, cache, saves and logs (default: ~/.local/share/flamingo-fork)
+#   FORK_HOME    prefix, cache and saves (default: ~/.local/share/flamingo-fork)
+#   FORK_LOGS    run logs (default: logs/ in this repository, git-ignored)
 #   VICTORY_*    passed through to victory.exe (see README.md)
 #   FORK_D3DCOMPILER  Microsoft's d3dcompiler_47.dll, if not found (see env.sh)
 set -e
@@ -17,7 +18,8 @@ EXE="${FORK_EXE:-$ROOT/target/x86_64-pc-windows-msvc/release/victory.exe}"
 
 [ -x "$PROTON_DIR/proton" ] || { echo "no Proton at $PROTON_DIR (set PROTON_DIR)" >&2; exit 1; }
 [ -f "$EXE" ] || { echo "no $EXE: run scripts/linux/build.sh first" >&2; exit 1; }
-mkdir -p "$FORK_HOME/cache" "$FORK_HOME/data" "$FORK_HOME/logs" "$FORK_HOME/prefix"
+LOGS="${FORK_LOGS:-$ROOT/logs}"
+mkdir -p "$FORK_HOME/cache" "$FORK_HOME/data" "$FORK_HOME/prefix" "$LOGS"
 
 # A Windows path for a Linux one (Wine maps / to Z:).
 winpath() { printf 'Z:%s' "$(realpath "$1")" | tr / '\\'; }
@@ -40,7 +42,7 @@ export VICTORY_DATA_DIR="$(winpath "$FORK_HOME/data")"
 # The built-in skip list holds a shader that hangs the AMD compiler only;
 # on other cards nothing is skipped unless VICTORY_SKIP_PIPELINES is set.
 export VICTORY_SKIP_PIPELINES="${VICTORY_SKIP_PIPELINES-}"
-LOG="$FORK_HOME/logs/$(date +%Y%m%d-%H%M%S)-${1:-run}.log"
+LOG="$LOGS/$(date +%Y%m%d-%H%M%S)-${1:-run}.log"
 
 case "$1" in
 check)

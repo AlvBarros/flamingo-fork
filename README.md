@@ -77,7 +77,7 @@ scripts/linux/run.sh play "/path/to/game/<the title's exe>" --console series-s
 scripts/linux/test.sh                                         # the test suite under Proton's wine
 ```
 
-The prefix, caches, saves and logs live in `~/.local/share/flamingo-fork` (`FORK_HOME`);
+The prefix, caches and saves live in `~/.local/share/flamingo-fork` (`FORK_HOME`), the run logs in `logs/` here (git-ignored);
 `PROTON_DIR` picks another Proton; `VICTORY_*` and `FLAMINGO_*` settings pass through.
 
 ### Playing
@@ -111,8 +111,8 @@ VICTORY_SHADER_OPT=0 VICTORY_WIDE_MERGE=1 FLAMINGO_OSD=1 VICTORY_AMBIENT=0.6 \
 
 ### Logs and troubleshooting
 
-- Each run writes a log in `~/.local/share/flamingo-fork/logs/` (the terminal stays quiet);
-  follow it with `tail -f ~/.local/share/flamingo-fork/logs/*-play.log`. The frame rate is logged
+- Each run writes a log in `logs/` in this repository (git-ignored; `FORK_LOGS` to change it; the terminal stays quiet);
+  follow it with `tail -f logs/*-play.log`. The frame rate is logged
   every few seconds.
 - **F9** toggles Flamingo's stats overlay. It is a Windows overlay window, untested under Wine;
   if it does not show, add `MANGOHUD=1` (with MangoHud installed) for a Linux one.
