@@ -1068,6 +1068,10 @@ pub(crate) fn module() -> HleModule {
 }
 
 /// Host input: XInput pads, the keyboard while our process has focus.
+/// Flamingo: a DualSense as the first pad while no XInput pad is there.
+#[cfg(windows)]
+mod dualsense;
+
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
@@ -1127,6 +1131,33 @@ mod host {
         }
     }
 
+    /// Flamingo: with no XInput pad in the first slot, a DualSense there
+    /// ([`super::dualsense`]), the scripted keys pressing it as they would
+    /// an XInput pad.
+    fn dualsense_pad(slot: usize) -> Option<PadState> {
+        if slot != 0 {
+            return None;
+        }
+        let r = super::dualsense::latest()?;
+        #[allow(unused_mut)]
+        let mut pad = PadState {
+            buttons: r.buttons,
+            left_trigger: r.left_trigger,
+            right_trigger: r.right_trigger,
+            left_x: r.left_x,
+            left_y: r.left_y,
+            right_x: r.right_x,
+            right_y: r.right_y,
+        };
+        #[cfg(feature = "keys")]
+        for vk in scripted() {
+            if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                pad.buttons |= button;
+            }
+        }
+        Some(pad)
+    }
+
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
@@ -1135,13 +1166,13 @@ mod host {
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
+                return dualsense_pad(slot);
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
+                return dualsense_pad(slot);
             }
             self.empty_until[slot] = None;
             #[allow(unused_mut)]

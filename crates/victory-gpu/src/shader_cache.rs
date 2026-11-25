@@ -82,6 +82,7 @@ fn build() -> &'static [u8; 32] {
                     // form or the host wave's own first lane.
                     "VICTORY_WAVE_WIDE_ONLY",
                     "VICTORY_FIRSTLANE_OWN_ONLY",
+                    "FLAMINGO_BVH_MISS",
                 ] {
                     append_switch(&mut bytes, name, std::env::var_os(name).as_deref());
                 }
@@ -116,9 +117,70 @@ fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
     .map_err(|e| e.to_string())
 }
 
+/// The stand-ins of `victory_shader::emit::stand_in` (from ScarlettPort,
+/// GPL-3.0-or-later), each opt-in:
+/// `VICTORY_AMBIENT_STUB=1` (the diffuse illumination's last pass writes
+/// `VICTORY_AMBIENT_STUB_VALUE`, 0.1 by default) and
+/// `VICTORY_SHADOWMASK_STUB=1` (the ray-traced distant shadows write
+/// `VICTORY_SHADOWMASK_STUB_VALUE`, 1 = lit; each output in its own encoding,
+/// by slot: `VICTORY_AMBIENT_STUB_SLOTS="152=rgb9e5,208=mask,*=f"`), for the containers in
+/// `VICTORY_AMBIENT_STUB_HASHES` / `VICTORY_SHADOWMASK_STUB_HASHES` (the
+/// title's by default). They replace those passes whenever switched on: the
+/// passes translate, but what they read comes from ray tracing, which does
+/// not run on the host yet. Not cached (the cache keys by container).
+fn stand_in(container: &[u8]) -> Option<HostShader> {
+    use victory_shader::emit::stand_in as s;
+    let hash = blake3::hash(container).to_hex()[..16].to_owned();
+    let kinds = [
+        ("VICTORY_AMBIENT_STUB", s::AMBIENT_HASHES, s::AMBIENT_VALUE, s::ambient_slots(&hash)),
+        ("VICTORY_SHADOWMASK_STUB", s::SHADOWMASK_HASHES, s::SHADOWMASK_VALUE, s::SHADOWMASK_SLOTS),
+    ];
+    for (name, hashes, value, defaults) in kinds {
+        if std::env::var(name).ok().as_deref().map(str::trim) != Some("1") {
+            continue;
+        }
+        let listed = match std::env::var(format!("{name}_HASHES")) {
+            Ok(v) => v
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .any(|h| h.eq_ignore_ascii_case(&hash)),
+            Err(_) => hashes.contains(&hash.as_str()),
+        };
+        if !listed {
+            continue;
+        }
+        let value = std::env::var(format!("{name}_VALUE"))
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(value);
+        let slots = std::env::var(format!("{name}_SLOTS")).unwrap_or_default();
+        let plan = s::Plan::new(value)
+            .with_overrides(defaults)
+            .with_overrides(&slots);
+        match s::storing_plan(container, plan) {
+            Ok((shader, plan)) => {
+                tracing::warn!(
+                    %hash,
+                    stand_in = name,
+                    value,
+                    outputs = ?plan.seen,
+                    "pass replaced by a stand-in writing each output in its own encoding"
+                );
+                return Some(shader);
+            }
+            Err(e) => {
+                tracing::warn!(%hash, stand_in = name, error = %e, "stand-in does not translate");
+            }
+        }
+    }
+    None
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    if let Some(shader) = stand_in(container) {
+        return Ok(shader);
+    }
     let translate = translate_listed;
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),

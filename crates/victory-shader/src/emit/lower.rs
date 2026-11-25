@@ -1430,6 +1430,11 @@ pub(super) fn host_max_wave() -> u32 {
     HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+thread_local! {
+    /// A stand-in's stores for this thread's translation ([`super::stand_in`]).
+    pub(super) static STORE_PLAN: std::cell::RefCell<Option<super::stand_in::Plan>> = const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
@@ -10500,6 +10505,18 @@ impl<'a> Lower<'a> {
                 } else {
                     self.float_of(v)?
                 });
+            }
+            // A stand-in ([`super::stand_in`]): the value in the output's own
+            // encoding, by the output's descriptor slot.
+            let slot = match src {
+                Source::Loaded { load, first } => match &self.x.p.blocks[load.0].insts[load.1].fields {
+                    Fields::Smem { offset, .. } => Some(*offset as u32 / 4 + u32::from(*first)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(bits) = STORE_PLAN.with(|p| p.borrow_mut().as_mut().map(|p| p.bits(slot))) {
+                vals = bits.map(|b| Some(self.s.m.f32(b)));
             }
             let h = self.handle(site, src, false, props)?;
             let at = self.begin_guarded(guard);

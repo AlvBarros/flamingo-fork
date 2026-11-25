@@ -124,6 +124,12 @@ TdrDelay raised to 60 s. Here TdrDelay is the default 2 s. Keep test runs short.
 | 61 | + victory-fork #798 (Series S keeps the title's own upscaler, not FSR 4; two code patches by signature) | window 13.97 fps, turned 13.70 fps (from here: a turn run, `f2turn.sh`, fps per view); untranslated 4 -> 1 |
 | 62 | run 61's build with `VICTORY_TITLE_PATCHES=0` (the comparison) | window 11.95 fps, turned 11.68 fps: #798 is worth 2 fps |
 | 63 | + victory-fork #823 (the wave-wide form for four refused compute programs by their hash; the structure builder's last programs) | **window 14.14 fps, turned 13.05 fps**; refused 5 -> 2. Now the launcher's build |
+| 64 | + `VICTORY_BVH_BUILDER=1` (all 53 builder pipelines exist since #823) | the title crashes 67 s in, as the world loads (reads of 0x8, 0x28 and of all-ones pointers): the builder's raw-address stores to pages not made ready are lost |
+| 65 | `FLAMINGO_BVH_MISS=1`: every ray-tracing node test misses (builder off) | the cutscene much brighter, faces lit; the title hung 180 s in (frames stopped, no device loss): left off |
+| 66 | ScarlettPort's stand-ins (`VICTORY_AMBIENT_STUB=1`, `VICTORY_SHADOWMASK_STUB=1`, ported, GPL-3.0) | the cutscene as dark as before, the player character's body gone in the world: left off |
+| 67 | diagnostics build + stack dumps | the submitting thread waits 41% of its time in `Host::settle`: one 20 KiB title buffer copy a frame out of the shader-written 174 MB buffer, 23-34 ms a frame |
+| 68 | `VICTORY_RELAY=2` (flights waited for by what they declared) | 13.37 / 12.56 fps: no gain |
+| 69 | `FLAMINGO_CARD_FILLS=1`: that copy and the misaligned constants of shader-written memory copied on the card | 6.86 / 7.85 fps, GPU wait 57-61 ms: a copy and two barriers per draw cost the card more than the wait: left off |
 
 ## Stats overlay
 

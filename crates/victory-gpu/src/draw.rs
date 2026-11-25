@@ -553,6 +553,13 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
+    // Flamingo: shader-written lately, copied on the card, in order.
+    if crate::shadow::card_fills()
+        && shadow.gpu_wrote_lately()
+        && let Some(gpu) = list.card_fill(&shadow, address, len)
+    {
+        return Some(gpu);
+    }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
     Some(gpu)
@@ -2384,6 +2391,15 @@ impl State {
                         }
                         if let Some((shadow, gpu)) = direct_constant(address, size) {
                             shadow.refresh(list, address, u64::from(size));
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
+                        // Flamingo: shader-written lately, copied on the card.
+                        if crate::shadow::card_fills()
+                            && let Some(shadow) = crate::shadow::find(address, u64::from(size).max(2))
+                            && shadow.gpu_wrote_lately()
+                            && let Some(gpu) = list.card_fill(&shadow, address, u64::from(size))
+                        {
                             host.constant_at(index, gpu, size);
                             continue;
                         }

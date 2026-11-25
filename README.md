@@ -19,8 +19,9 @@ Tested on one machine: Windows 11, NVIDIA RTX 4070 12 GB, Series S profile (`--c
 |-------|-------|
 | Boot, menus, start screen | work (30 fps) |
 | Opening cutscene | plays through; faces and hair show a dither pattern, eyes come out white, and much of it is too dark |
-| First gameplay scene | renders with the player in control: **about 14 fps** in one view and 13.1 fps turned toward the room |
+| First gameplay scene | renders with the player in control: **about 14 fps** facing the window; **9-12 fps** turned fully around toward the room, where the card is 80-85% busy; 4 fps for a few seconds while turning, as the room's textures stream in |
 | Shadowed areas | dark: the title's ray-traced bounce light and shadows do not run yet |
+| Geometry, characters | some geometry is missing in the first area and some character assets load wrong; under investigation |
 | Stability | 15-minute runs end without a device loss |
 
 <p align="center">
@@ -42,6 +43,11 @@ Flamingo's own work:
   `FLAMINGO_OSD=1` shows it from the start; `FLAMINGO_OSD=0` turns it off.
   <img src="https://github.com/realblastex/flamingo/releases/download/progress-2026-11-25/stats-overlay.png" alt="Stats overlay">
 - **Discord Rich Presence**: the game's name, menu or world, frame rate and time played.
+- **DualSense support**: a PlayStation 5 controller (and the DualSense Edge), over USB or
+  Bluetooth, is the title's first pad while no Xbox controller is connected. It is read over HID,
+  so Steam Input and DS4Windows are not needed. Buttons map by position (cross is A, circle is B,
+  and so on); Options is Menu, and Create or the touch pad click is View. `FLAMINGO_DUALSENSE=0`
+  turns it off. Rumble and the light bar are not driven yet.
 - **Faster submissions**:
   - title-memory copies that recover from a fault instead of a kernel call per copy;
   - table constant views read the buffer's own GPU copy, with no CPU fill and no wait;
@@ -63,6 +69,18 @@ Pull requests merged from victory-fork and VIctory that have not landed upstream
   (+2 fps).
 - victory-fork #823: four refused compute programs run on 32-lane GPUs, and the ray-tracing
   structure builder has all its pipelines.
+
+- victory-fork #768 (opt-in, `VICTORY_WIDE_TEXTURES=1`): a submission's texture checks run
+  several at a time.
+
+Experiments, all off by default, kept for testing (each has its result in FLAMINGO.md):
+
+- `VICTORY_AMBIENT_STUB=1`, `VICTORY_SHADOWMASK_STUB=1`: stand-ins for the ray-traced lighting
+  passes, ported from [ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort) (GPL-3.0). Here
+  they did not brighten the dark areas.
+- `FLAMINGO_BVH_MISS=1`: every ray-tracing node test misses. The cutscene gets brighter, but one run
+  hung.
+- `FLAMINGO_CARD_FILLS=1`: reads of memory that shaders wrote lately are made on the card. Slower.
 
 The full list, with the runs behind each one, is in [FLAMINGO.md](FLAMINGO.md).
 
@@ -107,6 +125,9 @@ For Discord Rich Presence, put your own Discord application id in
   above. The fork's own README is in [docs/victory-fork-README.md](docs/victory-fork-README.md).
 - **[victory-amd](https://github.com/myokex/victory-amd)** by myokex has an analysis of the dark
   shadowed areas that pointed at the missing ray-traced light.
+- **[ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort)** by ZigZagBoi1: the opt-in
+  stand-ins for the ray-traced lighting passes are ported from its VIctory-based runtime
+  (GPL-3.0-or-later).
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors (GPL-2.0-only) was used as
   a reference only. No XCL code is copied here.
 - Flamingo's changes were developed with [Claude Code](https://claude.com/claude-code).

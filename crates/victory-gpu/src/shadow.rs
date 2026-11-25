@@ -77,6 +77,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Flamingo: the frame (plus one) whose lists last declared shader
+    /// writes here ([`Shadow::gpu_wrote_lately`]); 0 if none ever did.
+    gpu_wrote: AtomicU64,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1563,6 +1566,48 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Flamingo (`FLAMINGO_CARD_FILLS=1`): reads of title memory that shaders
+/// wrote lately, made on the card in the list's order instead of on the
+/// CPU at submission. A read at submission has to wait for every flight
+/// that may write the memory to land: a 20 KiB title buffer copy out of the
+/// 174 MB buffer the shaders write held the submitting thread 23-34 ms a
+/// frame (run 67), and the misaligned constant buffers in that buffer read
+/// for draws did the same once the copy no longer did (run 45).
+pub(crate) fn card_fills() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLAMINGO_CARD_FILLS").is_some_and(|v| v == "1"))
+}
+
+/// A title buffer copy (`dst`, `src` title addresses, `len` bytes) made on
+/// the card when shaders wrote its source lately ([`card_fills`]): true if
+/// it was recorded so. What it writes goes back to title memory as shader
+/// writes do.
+pub(crate) fn copy_on_card(list: &HostList, dst: u64, src: u64, len: u64) -> bool {
+    if len == 0 || !card_fills() {
+        return false;
+    }
+    let Some(from) = find(src, len) else { return false };
+    if !from.gpu_wrote_lately() {
+        return false;
+    }
+    let Some(to) = find(dst, len) else { return false };
+    if Arc::ptr_eq(&from, &to) || from.left(src) < len || to.left(dst) < len {
+        return false;
+    }
+    // SAFETY: plain queries of live buffers.
+    let (from_base, to_base) = unsafe { (from.buffer.GetGPUVirtualAddress(), to.buffer.GetGPUVirtualAddress()) };
+    let (Some(from_at), Some(to_at)) = (from.gpu(src).checked_sub(from_base), to.gpu(dst).checked_sub(to_base)) else {
+        return false;
+    };
+    from.refresh(list, src, len);
+    to.refresh(list, dst, len);
+    to.gpu_writes(list, dst, len);
+    // SAFETY: an open list and live buffers; the ranges lie in them. The
+    // title's own barriers order it against the shaders around it.
+    unsafe { list.list.CopyBufferRegion(&to.buffer, to_at, &from.buffer, from_at, len) };
+    true
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
@@ -1900,7 +1945,15 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            gpu_wrote: AtomicU64::new(0),
         }
+    }
+
+    /// Flamingo: whether lists of this frame or the last declared shader
+    /// writes here: what title memory holds here may be behind the card's.
+    pub(crate) fn gpu_wrote_lately(&self) -> bool {
+        let wrote = self.gpu_wrote.load(Ordering::Relaxed);
+        wrote != 0 && wrote + 1 >= crate::frame::current()
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -1920,6 +1973,7 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        self.gpu_wrote.store(crate::frame::current() + 1, Ordering::Relaxed);
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer

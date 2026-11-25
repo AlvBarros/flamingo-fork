@@ -89,6 +89,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+pub mod stand_in;
 mod lower;
 mod own_bits;
 mod rect;
