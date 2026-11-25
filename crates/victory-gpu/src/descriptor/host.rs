@@ -794,6 +794,17 @@ pub(crate) fn near_heaps(va: u64) -> String {
 /// tiers 1 and 2; tier 3 hardware may take more.
 const PORTABLE_VIEWS: u32 = 1_000_000;
 
+/// Flamingo: locks for making slots' descriptors outside the slots' own
+/// lock ([`HostHeap::mirror`]), by slot number.
+static SLOT_STRIPES: [Mutex<()>; 256] = [const { Mutex::new(()) }; 256];
+
+/// Whether [`HostHeap::mirror`] makes descriptors outside the slots' lock
+/// (`FLAMINGO_MIRROR_UNLOCKED=0`: under it, as before).
+fn mirror_unlocked() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FLAMINGO_MIRROR_UNLOCKED").is_none_or(|v| v != "0"))
+}
+
 /// The size of every host view heap on a host that takes more than
 /// [`PORTABLE_VIEWS`] (AMD): the title's heap (a little over 1,000,000
 /// views in the retail game) plus [`DYNAMIC`] fits with room to spare, and
@@ -2000,12 +2011,31 @@ impl HostHeap {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return Some(view);
             }
-            made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
-            } else {
-                make(&view, self.cpu(index))
-            };
+            let claim = if later { 0 } else { key };
+            made[index as usize] = claim;
+            if !mirror_unlocked() {
+                let kept = if later { None } else { make(&view, self.cpu(index)) };
+                if kept.is_none() && !self.sampler {
+                    null_for(&view, self.cpu(index));
+                }
+                self.keep(index, kept.flatten());
+                return Some(view);
+            }
+            // Flamingo: the descriptor is made outside the slots' lock,
+            // which the recording threads take for their draws and the
+            // descriptor sync for every changed record (its driver calls
+            // under that lock: 7% of the submitting thread waiting, run 94).
+            // Under the lock of the slot's stripe, and only while the slot
+            // still holds this claim: a newer one makes its own after, so
+            // the slot ends with the newest view.
+            drop(made);
+            let _stripe = SLOT_STRIPES[index as usize % SLOT_STRIPES.len()]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.made.lock().unwrap_or_else(|e| e.into_inner())[index as usize] != claim {
+                return Some(view);
+            }
+            let kept = if later { None } else { make(&view, self.cpu(index)) };
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
