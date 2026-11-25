@@ -232,13 +232,16 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        name = program_name(&self.container).unwrap_or("?"),
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        SHADERS_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            name = program_name(&self.container).unwrap_or("?"),
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        )
+                    }
                 }
                 done.ok()
             })
@@ -656,6 +659,19 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 pub(crate) fn making() -> u64 {
     make::waiting()
 }
+
+/// Flamingo, for the stats overlay: pipelines made since the start and
+/// those without a host pipeline ([`make::made`]), and shaders that do not
+/// translate.
+#[cfg(windows)]
+pub(crate) fn overlay_counts() -> (u64, u64, u64) {
+    let (made, failed) = make::made();
+    (made, failed, SHADERS_FAILED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Shaders that do not translate, since the start.
+#[cfg(windows)]
+static SHADERS_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
