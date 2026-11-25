@@ -22,6 +22,7 @@ Tested on one machine: Windows 11, NVIDIA RTX 4070 12 GB, Series S profile (`--c
 | First gameplay scene | renders with the player in control: **about 14 fps** facing the window; **9-12 fps** turned fully around toward the room, where the card is 80-85% busy; 4 fps for a few seconds while turning, as the room's textures stream in |
 | Shadowed areas | dark: the title's ray-traced bounce light and shadows do not run yet |
 | Geometry, characters | some geometry is missing in the first area and some character assets load wrong; under investigation |
+| Latest tree | victory-fork main is merged in (run 84): the cell window's wire grate now draws, but the frame rate is lower for now (9-10 fps, first measurement with a cold shader cache) and is being worked on |
 | Stability | 15-minute runs end without a device loss |
 
 <p align="center">
@@ -81,6 +82,11 @@ Experiments, all off by default, kept for testing (each has its result in FLAMIN
 - `FLAMINGO_BVH_MISS=1`: every ray-tracing node test misses. The cutscene gets brighter, but one run
   hung.
 - `FLAMINGO_CARD_FILLS=1`: reads of memory that shaders wrote lately are made on the card. Slower.
+- `VICTORY_AMBIENT=<level>`: after the indirect-light resolve, its output is replaced by a constant
+  (from [Belobug's fork](https://github.com/Belobug/VIctory-Belobug-AMD), GPL-3.0). At 0.6 the
+  opening cutscene washed out grey.
+- `FLAMINGO_QUAD_HELPERS=1`: in pixel shaders, reads of the quad's other lanes reach helper lanes
+  (also from Belobug's fork). Sharper fine detail, about 18% slower.
 
 The full list, with the runs behind each one, is in [FLAMINGO.md](FLAMINGO.md).
 
@@ -128,6 +134,10 @@ For Discord Rich Presence, put your own Discord application id in
 - **[ScarlettPort](https://github.com/ZigZagBoi1/ScarlettPort)** by ZigZagBoi1: the opt-in
   stand-ins for the ray-traced lighting passes are ported from its VIctory-based runtime
   (GPL-3.0-or-later).
+- **[Belobug's VIctory fork](https://github.com/Belobug/VIctory-Belobug-AMD)**: the opt-in ambient
+  pass and quad helper reads are ported from it (GPL-3.0).
+- The mesh primitive edge-flag fix came as pull request #1 to this repository, a port of upstream
+  VIctory #1718.
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors (GPL-2.0-only) was used as
   a reference only. No XCL code is copied here.
 - Flamingo's changes were developed with [Claude Code](https://claude.com/claude-code).

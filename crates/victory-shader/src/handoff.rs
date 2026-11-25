@@ -309,7 +309,7 @@ pub fn es_record(p: &Program) -> Result<EsRecord, ShaderError> {
                 Some(_) => return Err(unsupported("ES record writes at more than one base")),
             }
             let byte = lin.add.wrapping_add(u32::from(*offset0) | u32::from(*offset1) << 8);
-            if byte % 4 != 0 {
+            if !byte.is_multiple_of(4) {
                 return Err(unsupported("a record write off a dword"));
             }
             stores.push(Store { site: (b, i), dword: byte / 4, count, reg: d });
@@ -361,7 +361,7 @@ pub fn vertex_reads(p: &Program) -> Result<Vec<VertexRead>, ShaderError> {
                 return Err(unsupported("an LDS read without a destination"));
             };
             let byte = lin.add.wrapping_add(u32::from(*offset0) | u32::from(*offset1) << 8);
-            if byte % 4 != 0 {
+            if !byte.is_multiple_of(4) {
                 return Err(unsupported("a vertex read off a dword"));
             }
             out.push(VertexRead { site: (b, i), vertex: vertex as u8, dword: byte / 4, count, reg: d });
@@ -417,7 +417,7 @@ pub fn own_accesses(p: &Program) -> Result<Vec<Access>, ShaderError> {
                 _ => return Err(unsupported("an LDS access without a register")),
             };
             let byte = lin.add.wrapping_add(u32::from(*offset0) | u32::from(*offset1) << 8);
-            if byte % 4 != 0 {
+            if !byte.is_multiple_of(4) {
                 return Err(unsupported("an LDS access off a dword"));
             }
             out.push(Access { site: (b, i), write, base: lin.base, mul: lin.mul, byte, count, reg });

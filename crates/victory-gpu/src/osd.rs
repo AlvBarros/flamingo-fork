@@ -355,14 +355,16 @@ mod tests {
             let old = SelectObject(dc, bitmap.into());
             paint(dc);
             SelectObject(dc, old);
-            let mut info = BITMAPINFO::default();
-            info.bmiHeader = BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: W,
-                biHeight: -H,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: W,
+                    biHeight: -H,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let mut pixels = vec![0u32; (W * H) as usize];

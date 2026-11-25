@@ -130,6 +130,17 @@ TdrDelay raised to 60 s. Here TdrDelay is the default 2 s. Keep test runs short.
 | 67 | diagnostics build + stack dumps | the submitting thread waits 41% of its time in `Host::settle`: one 20 KiB title buffer copy a frame out of the shader-written 174 MB buffer, 23-34 ms a frame |
 | 68 | `VICTORY_RELAY=2` (flights waited for by what they declared) | 13.37 / 12.56 fps: no gain |
 | 69 | `FLAMINGO_CARD_FILLS=1`: that copy and the misaligned constants of shader-written memory copied on the card | 6.86 / 7.85 fps, GPU wait 57-61 ms: a copy and two barriers per draw cost the card more than the wait: left off |
+| 70 | the launcher build, the camera held right for 18 s (fully round, to the cell door) | window 13.4 fps; turned 8.6-12.3 fps with the card 80-85% busy (GPU-bound) and 4,700-6,200 draws; while turning 3.7-3.9 fps as texture checks reach 33 ms and 127 MB a frame |
+| 71, 72 | diagnostics build with `VICTORY_BARRIER_TEST=both`, and without | window 13.1 vs 12.4 fps: the waits for every shader write cost about 5% |
+| 73 | + victory-fork a26859f (byte-copied descriptor records mirrored), without 8dd30ab's view guard | 7.8 fps: the pass looks at 320,000 slots a frame. Kept on a scratch branch, not used |
+| 74-76 | + DualSense support, + #768 (`VICTORY_WIDE_TEXTURES=1`) | a connected DualSense becomes pad 1 and the scripted turn does nothing: test runs set `FLAMINGO_DUALSENSE=0`. With #768: window 13.65 fps, no dip below 11.7 fps while turning. Both now in the launcher |
+| 77 | + victory-amd bddfb4a (a texture with only its smaller mips detiles from its start), 4d64efe (DirectStorage page arrays read when a request runs) and c6dc4d8 (a write through one view of a page seen at its other views) | the title stopped at its own breakpoint in the opening cutscene (0x80000003) |
+| 78 | as 77, `VICTORY_VIEW_GUARD=0` | no stop; window 13.65 fps, turned 13.08. The cell's wall and the cutscene's lamps show where run 76 had black. c6dc4d8's guard is now off by default (`VICTORY_VIEW_GUARD=1` on) |
+| 79 | + Belobug's ambient pass, `VICTORY_AMBIENT=0.6`: the indirect-light resolve's output replaced by a constant | worse: the cutscene washed out grey, and the player's body did not draw. Off by default |
+| 80, 81 | + Belobug 03629f3, `FLAMINGO_QUAD_HELPERS=1`: in pixel shaders, reads of the quad's other lanes reach helper lanes | the cell window's glass shows its dirt and reflections, faces look smoother. Run 80 translated every shader again (12.65 / 12.15 fps); run 81 is the warm rerun |
+| 82, 83 | quad helper reads in one quad operation for fixed patterns (across X, Y, the diagonal, one lane for all) | the cell window's wire grate draws sharp, hair shows more detail; warm (83): 11.2 fps at the window against 13.65 without (run 78), about 18% for thin geometry sampling its full-detail levels. Stays opt-in |
+| 84 | merged victory-fork main (f85101b: a submit thread, a copy queue for fetches, safer indirect windows, the first room's descriptors mirrored, the shader cache keyed on the translator instead of the executable), victory-fork #847's test change, victory-amd bddfb4a and 4d64efe again on top, Belobug's opt-ins | the grate draws sharp with no quad change (the fork's a26859f); 9.57 fps at the window, 9.38 turned, cold cache: preparing 41 to 58 ms, copy-back 23 to 35 ms. The fork's view guard is on by default here |
+| 85 | + the mesh primitive edge-flag fix (pull request #1 to this repository, from upstream VIctory #1718): a corner's index is 9 bits, the 10th is its edge flag | measuring |
 
 ## Stats overlay
 

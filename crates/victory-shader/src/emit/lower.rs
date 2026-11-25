@@ -1422,6 +1422,26 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// The refusal of a first half of an interpolation whose result is read
+/// as data ([`Lower::interp`]).
+pub(super) const FIRST_HALF: &str = "the first half of an interpolation";
+
+thread_local! {
+    /// Whether first halves of interpolations are evaluated as the pair
+    /// they start ([`with_first_half_pairs`]).
+    static FIRST_HALF_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `translate` with first halves of interpolations evaluated as the
+/// pair they start: the translation of a program refused with
+/// [`FIRST_HALF`] (`VICTORY_FIRST_HALF=0`: refused again, as before).
+pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
+    let before = FIRST_HALF_PAIRS.replace(true);
+    let result = translate();
+    FIRST_HALF_PAIRS.set(before);
+    result
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1951,7 +1971,9 @@ impl<'a> Lower<'a> {
                 // the other half of its dst, PS_DeferredTextured): evaluated as the pair it
                 // starts. Approximate for those other bits (P0 + i P10 on the console); a
                 // first half only the second half reads is gone before lowering.
-                if std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0") {
+                // Only in the second translation of a program the first
+                // one refused for it ([`with_first_half_pairs`]).
+                if FIRST_HALF_PAIRS.get() && std::env::var_os("VICTORY_FIRST_HALF").is_none_or(|v| v != "0") {
                     for (_, i) in &x.io.interps {
                         if let Interp::Interpolated { first, .. } = i {
                             for s in first {
@@ -4815,6 +4837,49 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a read of another lane of this lane's quad goes through quad
+    /// reads, which reach helper lanes: in a pixel shader, with
+    /// `FLAMINGO_QUAD_HELPERS=1`. At a triangle's edge the quad's other
+    /// pixels are helpers (and so are discarded ones), which wave reads do
+    /// not see: a derivative taken by hand was then the whole value, the
+    /// texture read that used it took its smallest level, and triangles'
+    /// edges showed as lines on car paint, glass and skin. From Belobug's
+    /// VIctory fork (03629f3, GPL-3.0), where it is on.
+    fn helpers_read(&self, quad: bool) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        quad && self.s.pixel && *ON.get_or_init(|| std::env::var_os("FLAMINGO_QUAD_HELPERS").is_some_and(|v| v == "1"))
+    }
+
+    /// `x` of the lane `perm` names for each place in the quad, in one quad
+    /// operation where the pattern is one: a swap across X, Y or the
+    /// diagonal, or one lane for all (a derivative by hand). `None` for other
+    /// patterns, which [`Self::quad_pick`] reads lane by lane (four reads and
+    /// four selects).
+    fn quad_fixed(&mut self, x: V, perm: [u32; 4]) -> Option<V> {
+        let c = self.cur;
+        if perm == [0, 1, 2, 3] {
+            return Some(x);
+        }
+        let kind = match perm {
+            [a, b, c, d] if a == b && b == c && c == d => None,
+            [1, 0, 3, 2] => Some(0),
+            [2, 3, 0, 1] => Some(1),
+            [3, 2, 1, 0] => Some(2),
+            _ => return None,
+        };
+        self.s.flags |= flags::WAVE_OPS;
+        Some(match kind {
+            None => {
+                let lane = self.s.m.i32(perm[0]);
+                self.s.op(c, "quadReadLaneAt.i32", Attr::NoUnwind, self.s.t.i32, 122, &[x, lane])
+            }
+            Some(kind) => {
+                let kind = self.s.m.i8(kind);
+                self.s.op(c, "quadOp.i32", Attr::NoUnwind, self.s.t.i32, 123, &[x, kind])
+            }
+        })
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -5154,8 +5219,11 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
-                self.quad_pick(x, src)
+            let r = if mesh_quad || self.helpers_read(quad) {
+                match self.quad_fixed(x, swizzle_quad(offset)) {
+                    Some(r) => r,
+                    None => self.quad_pick(x, src),
+                }
             } else {
                 self.read_lane(x, src)
             };
@@ -7555,8 +7623,15 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
-            self.quad_pick(x, src)
+        let mut r = if mesh_quad || self.helpers_read(quad) {
+            let fixed = match dpp {
+                Dpp::Row { ctrl, .. } if quad => self.quad_fixed(x, quad_perm(u32::from(ctrl & 0xFF))),
+                _ => None,
+            };
+            match fixed {
+                Some(r) => r,
+                None => self.quad_pick(x, src),
+            }
         } else {
             self.read_lane(x, src)
         };
@@ -8101,12 +8176,6 @@ impl<'a> Lower<'a> {
                 let r = self.read_lane(x, from);
                 int(self, r)
             }
-            "v_cvt_f32_f64" => {
-                let (lo, hi) = self.f64_pair(inst, 0)?;
-                let bits = self.f64_to_f32_bits(lo, hi);
-                let r = self.as_float(bits);
-                float(self, r)
-            }
             "v_cvt_f32_i32" | "v_cvt_f32_u32" | "v_cvt_f32_ubyte0" | "v_cvt_f32_ubyte1"
             | "v_cvt_f32_ubyte2" | "v_cvt_f32_ubyte3" => {
                 let mut a = s(self, 0)?;
@@ -8122,6 +8191,12 @@ impl<'a> Lower<'a> {
                     Cast::UiToFp
                 };
                 let r = self.s.m.cast(c, op, a, self.s.t.f32);
+                float(self, r)
+            }
+            "v_cvt_f32_f64" => {
+                let (lo, hi) = self.f64_pair(inst, 0)?;
+                let bits = self.f64_to_f32_bits(lo, hi);
+                let r = self.as_float(bits);
                 float(self, r)
             }
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
@@ -9991,7 +10066,7 @@ impl<'a> Lower<'a> {
                     return Ok(());
                 }
             }
-            return Err("the first half of an interpolation");
+            return Err(FIRST_HALF);
         };
         let name = inst.name();
         let (dst, src) = match &inst.fields {
@@ -11840,8 +11915,8 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// Mesh: each 10-bit corner field holds a 9-bit vertex index and its
+    /// edge flag. Bit 31 culls the primitive.
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
@@ -11874,7 +11949,7 @@ impl<'a> Lower<'a> {
         });
         let mut indices = [z; 3];
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {
@@ -12245,6 +12320,42 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
         Barycentric::LinearSample => 7,
         Barycentric::PerspectivePullModel => return None,
     })
+}
+
+/// The source place in the quad of each place, for a DPP `quad_perm`
+/// control (two bits a place, the first place lowest).
+fn quad_perm(ctrl: u32) -> [u32; 4] {
+    [0, 1, 2, 3].map(|p| ctrl >> (2 * p) & 3)
+}
+
+/// The same for a quad-local `ds_swizzle_b32` offset: the quad mode (bit
+/// 15) names the places as a `quad_perm` does; the bit-mask mode is
+/// `((lane & and) | or) ^ xor`, which stays in the quad when the masks keep
+/// the lane's higher bits (the `quad` test at the swizzle).
+fn swizzle_quad(offset: u32) -> [u32; 4] {
+    if offset & 0x8000 != 0 {
+        return quad_perm(offset & 0xFF);
+    }
+    let (and, or, xor) = (offset & 0x1F, offset >> 5 & 0x1F, offset >> 10 & 0x1F);
+    [0, 1, 2, 3].map(|p| ((p & and) | or) ^ xor & 3)
+}
+
+#[cfg(test)]
+mod quad_tests {
+    use super::{quad_perm, swizzle_quad};
+
+    #[test]
+    fn quad_patterns() {
+        // quad_perm(1, 0, 3, 2): across X; (2, 3, 0, 1): across Y.
+        assert_eq!(quad_perm(0b10_11_00_01), [1, 0, 3, 2]);
+        assert_eq!(quad_perm(0b01_00_11_10), [2, 3, 0, 1]);
+        assert_eq!(quad_perm(0), [0, 0, 0, 0]);
+        assert_eq!(swizzle_quad(0x8000 | 0b00_01_10_11), [3, 2, 1, 0]);
+        // Bit-mask mode: keep the high bits, xor 1 (across X); and with 0x1C (lane 0 of the quad).
+        assert_eq!(swizzle_quad(0x1F | 1 << 10), [1, 0, 3, 2]);
+        assert_eq!(swizzle_quad(0x1C), [0, 0, 0, 0]);
+        assert_eq!(swizzle_quad(0x1C | 2 << 5), [2, 2, 2, 2]);
+    }
 }
 
 #[cfg(test)]
