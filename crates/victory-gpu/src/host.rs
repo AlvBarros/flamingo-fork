@@ -729,7 +729,15 @@ pub(crate) fn on_software_adapter(device: &ID3D12Device) -> bool {
         let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
             return false;
         };
-        adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+        let Ok(d) = adapter.GetDesc1() else {
+            return false;
+        };
+        let name = String::from_utf16_lossy(&d.Description).trim_end_matches('\0').to_owned();
+        // Microsoft's own adapters (vendor 0x1414: WARP, the Basic Render
+        // Driver of a machine with no GPU) render in software.
+        let software = d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == 0x1414;
+        eprintln!("host adapter: {name} (vendor {:#x}, software {software})", d.VendorId);
+        software
     }
 }
 
