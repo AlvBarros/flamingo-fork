@@ -11,6 +11,62 @@ own legally obtained copy, on an NVIDIA RTX 4070.
 **This repository contains no game files, code or assets.** You need your own copy. Flamingo is
 not affiliated with or endorsed by any game's developer or publisher, or by Microsoft.
 
+## This fork: Linux through Proton
+
+A fork of [Flamingo](https://github.com/realblastex/flamingo) for running it on Linux through
+Proton, on the same card Flamingo targets. The sections after this one are Flamingo's own,
+measured on Windows 11.
+
+| | |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4070, 12 GB (driver 595.71, proprietary) |
+| CPU | Intel Core i5-14400F (6 performance + 4 efficiency cores, AVX2) |
+| RAM | 32 GB |
+| OS | Arch Linux, kernel 6.18 LTS |
+| Runs through | Proton 11.0 (Wine + vkd3d-proton for Direct3D 12) |
+| Built with | Rust 1.98.1 and [cargo-xwin](https://github.com/rust-cross/cargo-xwin), for `x86_64-pc-windows-msvc` |
+
+| Status (2026-11-25) | |
+|---|---|
+| Build on Linux | ✅ `scripts/linux/build.sh` |
+| Direct3D 12 device under Proton | ✅ `scripts/linux/run.sh check` (SM 6.8, mesh shaders, DXR 1.1 through vkd3d-proton) |
+| Pipeline cache kept between runs under vkd3d-proton | ✅ null-blob empty library (gmankab, from KLBF Lab / VIctory#347) |
+| Test suite under Proton | ✅ 739 of 744 (`scripts/linux/test.sh`); the 5 left are Wine's: no event-log subscription (driver watch), vkd3d-proton accepts unsigned DXIL, `cargo`/`git` started inside Wine, `ws2_32` lacks `WSAConnectByList` |
+| In game | ⏳ not run yet |
+
+Facts found on this machine that matter under Proton:
+
+- **Microsoft's `d3dcompiler_47.dll` is required.** The layer compiles compute shaders at run
+  time with `D3DCompile` (the indirect-argument clamp, the card compare, the ambient light and
+  others); Wine's built-in compiler rejects them, and without the clamp every indirect draw is
+  dropped. The scripts install Microsoft's DLL into the prefix: `FORK_D3DCOMPILER=/path/to/it`,
+  or `~/.local/share/flamingo-fork/d3dcompiler_47.dll`, or one shipped with an installed Steam
+  game. It cannot be included here.
+- **vkd3d-proton allows about 10.5 GB of the 12 GB** for the game and caps view heaps at
+  1,000,000 descriptors. Prefer `--console series-s`.
+- **AMD-only console instructions on an Intel CPU** (`monitorx`/`mwaitx`, SSE4a, `clzero`,
+  `rdpru`) are emulated by the crash handler; an emulated `monitorx` costs ~1.4 µs under Proton
+  here (about 40% of a core at the title's ~280,000 a second, on a thread that only waits).
+- **Fast cores:** Wine reports the P/E cores correctly, but `SetThreadSelectedCpuSets` is a stub
+  there, so `VICTORY_FAST_CORES` does nothing under Proton; Linux's scheduler places the threads.
+- Windows-only extras, untested here: the stats overlay (F9; `FLAMINGO_OSD=0`; MangoHud works on
+  Linux), DualSense over HID (`FLAMINGO_DUALSENSE=0`), Discord presence (needs a bridge).
+
+### Build, run and test on Linux
+
+Needs `rustup`, Steam with Proton 11.0, and `cargo install --locked cargo-xwin` (it downloads the
+Microsoft CRT and Windows SDK under Microsoft's license). No system LLVM or sudo.
+
+```sh
+scripts/linux/build.sh
+scripts/linux/run.sh check                                    # Direct3D 12 device, no game needed
+scripts/linux/run.sh play "/path/to/game/<the title's exe>" --console series-s
+scripts/linux/test.sh                                         # the test suite under Proton's wine
+```
+
+The prefix, caches, saves and logs live in `~/.local/share/flamingo-fork` (`FORK_HOME`);
+`PROTON_DIR` picks another Proton; `VICTORY_*` and `FLAMINGO_*` settings pass through.
+
 ## Status (2026-11-25)
 
 Tested on one machine: Windows 11, NVIDIA RTX 4070 12 GB, Series S profile (`--console series-s`).
