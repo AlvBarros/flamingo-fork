@@ -106,6 +106,8 @@ mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
+mod helper_lane_tests;
+#[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
@@ -2321,7 +2323,7 @@ mod barycentric_tests {
         3 << 25 | dst << 17 | b << 9 | (256 + a)
     }
 
-    fn element(name: &str, kind: u8, row: u32) -> SigElement {
+    pub(super) fn element(name: &str, kind: u8, row: u32) -> SigElement {
         SigElement {
             name: name.into(),
             index: 0,
@@ -2355,6 +2357,27 @@ mod barycentric_tests {
         layout: Vec<RootParam>,
         used: Vec<UsedResource>,
     ) -> Result<HostShader, ShaderError> {
+        pixel_signed(words, input_addr, fp16, layout, used, &[element("TEXCOORD", 0, 0)])
+    }
+
+    /// [`pixel`] with the input signature `inputs` (VIctory-dexnom 921d8d3).
+    pub(super) fn pixel_with_inputs(
+        words: &[u32],
+        input_addr: u32,
+        inputs: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
+        pixel_signed(words, input_addr, false, Vec::new(), Vec::new(), inputs)
+    }
+
+    /// [`pixel_of`] with the input signature `inputs`.
+    fn pixel_signed(
+        words: &[u32],
+        input_addr: u32,
+        fp16: bool,
+        layout: Vec<RootParam>,
+        used: Vec<UsedResource>,
+        inputs: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -2380,7 +2403,7 @@ mod barycentric_tests {
         };
         let mut target = element("SV_Target", 16, 0);
         target.usage = 15;
-        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+        let isg1 = container::signature(inputs, true);
         let osg1 = container::signature(&[target], false);
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
