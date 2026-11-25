@@ -126,6 +126,10 @@ pub fn run(
     crate::discord::start(title_dir);
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
+    // Flamingo: scheduled stack dumps (`VICTORY_STACKS`) in every build, for
+    // a sampling profile of the build that is measured; off unless set.
+    #[cfg(all(windows, feature = "stacks", not(feature = "diagnostics")))]
+    victory_loader::dump_stacks_on_schedule();
     let late = LateDlls {
         host: resolver.host.clone(),
         title_dir: title_dir.to_owned(),

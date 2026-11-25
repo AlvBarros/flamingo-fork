@@ -28,7 +28,7 @@ mod crash;
 mod hooks;
 pub mod prepare;
 pub mod resolve;
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(windows, feature = "stacks"))]
 mod stacks;
 #[cfg(windows)]
 mod threads;
@@ -47,7 +47,7 @@ pub use crash::{
 pub use crash::save_on_crash;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(all(windows, feature = "stacks"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
