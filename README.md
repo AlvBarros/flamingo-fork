@@ -80,6 +80,50 @@ scripts/linux/test.sh                                         # the test suite u
 The prefix, caches, saves and logs live in `~/.local/share/flamingo-fork` (`FORK_HOME`);
 `PROTON_DIR` picks another Proton; `VICTORY_*` and `FLAMINGO_*` settings pass through.
 
+### Playing
+
+**Your dump stays together, outside this repository.** Use a dump of your own legally obtained
+copy, kept as it came: the executable with `MicrosoftGame.config` and every other file and folder
+beside it (for example `~/Games/<the title>/`). The folder the executable is in is taken as the
+title's install folder: the manifest (the title's id, which picks the save folder) and its data
+archives are found relative to it, so an executable moved on its own does not start. Never put a
+dump inside this repository (the asset policy; the tools refuse to write game-derived output under
+it).
+
+Run it with the settings Flamingo is tuned with on an RTX 4070, plus the ambient light:
+
+```sh
+VICTORY_NO_WATCHDOG=1 VICTORY_PIPELINE_WAIT_MS=24 VICTORY_RELAY=1 VICTORY_LATE_WAIT=3 \
+VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024 VICTORY_INDIRECT_WINDOW=1 \
+VICTORY_SHADER_OPT=0 VICTORY_WIDE_MERGE=1 FLAMINGO_OSD=1 VICTORY_AMBIENT=0.6 \
+  scripts/linux/run.sh play "$HOME/Games/<the title>/<the title's exe>" --console series-s
+```
+
+- **`--console series-s`**: renders at 1280×720 and upscales with the title's own upscaler, and
+  commits less memory. Pass it: vkd3d-proton gives the title about 10.5 of the card's 12 GB, and
+  on a PC with 24 GB of RAM or more Flamingo otherwise picks the heavier Series X profile.
+- **`VICTORY_AMBIENT=0.6`**: the constant ambient light (off by default in Flamingo); lower is
+  darker (about 0.07 bluish suits night, about 0.3 warm dusk), `VICTORY_AMBIENT=off` for none.
+- **First launch**: shaders are translated and compiled for several minutes; the loading screen
+  can stay frozen with sound playing. Later launches use the cache.
+- **Controller**: plug it in before starting; plugging it in during play pauses the title.
+- **Paths** with spaces are fine in quotes.
+
+### Logs and troubleshooting
+
+- Each run writes a log in `~/.local/share/flamingo-fork/logs/` (the terminal stays quiet);
+  follow it with `tail -f ~/.local/share/flamingo-fork/logs/*-play.log`. The frame rate is logged
+  every few seconds.
+- **F9** toggles Flamingo's stats overlay. It is a Windows overlay window, untested under Wine;
+  if it does not show, add `MANGOHUD=1` (with MangoHud installed) for a Linux one.
+- After a rebuild, if the picture is wrong or the game crashes while compiling, delete
+  `~/.local/share/flamingo-fork/cache/pipelines` first: a pipeline cache from another build can
+  get in the way.
+- On a crash or a hang, the newest log is what to look at first: `device removed`, `no host
+  pipeline`, `cannot present`, and the lines before the end.
+- `scripts/linux/run.sh check` confirms the Direct3D 12 device without the game, and prints a
+  warning if Microsoft's `d3dcompiler_47.dll` was not found (see above).
+
 ## Status (2026-11-25)
 
 Tested on one machine: Windows 11, NVIDIA RTX 4070 12 GB, Series S profile (`--console series-s`).
