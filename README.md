@@ -23,7 +23,7 @@ measured on Windows 11.
 | CPU | Intel Core i5-14400F (6 performance + 4 efficiency cores, AVX2) |
 | RAM | 32 GB |
 | OS | Arch Linux, kernel 6.18 LTS |
-| Runs through | Proton 11.0 (Wine + vkd3d-proton for Direct3D 12) |
+| Runs through | Proton Experimental (Wine + vkd3d-proton for Direct3D 12); Proton 11.0's vkd3d-proton crashes in the first load, see below |
 | Built with | Rust 1.98.1 and [cargo-xwin](https://github.com/rust-cross/cargo-xwin), for `x86_64-pc-windows-msvc` |
 
 | Status (2026-11-25) | |
@@ -32,7 +32,7 @@ measured on Windows 11.
 | Direct3D 12 device under Proton | ✅ `scripts/linux/run.sh check` (SM 6.8, mesh shaders, DXR 1.1 through vkd3d-proton) |
 | Pipeline cache kept between runs under vkd3d-proton | ✅ null-blob empty library (gmankab, from KLBF Lab / VIctory#347) |
 | Test suite under Proton | ✅ 744 of 749 (`scripts/linux/test.sh`); the 5 left are Wine's: no event-log subscription (driver watch), vkd3d-proton accepts unsigned DXIL, `cargo`/`git` started inside Wine, `ws2_32` lacks `WSAConnectByList` |
-| In game | ⏳ not run yet |
+| In game | ⏳ menus and the opening cutscene under Proton Experimental; the first launch is at ~0.2 fps while over a thousand pipelines compile (not yet measured after that) |
 
 Brought in from other forks (each with a test that runs on the RTX 4070 under Proton):
 
@@ -67,7 +67,7 @@ Facts found on this machine that matter under Proton:
 
 ### Build, run and test on Linux
 
-Needs `rustup`, Steam with Proton 11.0, and `cargo install --locked cargo-xwin` (it downloads the
+Needs `rustup`, Steam with Proton Experimental (Proton 11.0 builds and tests, but the game dies in it), and `cargo install --locked cargo-xwin` (it downloads the
 Microsoft CRT and Windows SDK under Microsoft's license). No system LLVM or sudo.
 
 ```sh
@@ -78,7 +78,8 @@ scripts/linux/test.sh                                         # the test suite u
 ```
 
 The prefix, caches and saves live in `~/.local/share/flamingo-fork` (`FORK_HOME`), the run logs in `logs/` here (git-ignored);
-`PROTON_DIR` picks another Proton; `VICTORY_*` and `FLAMINGO_*` settings pass through.
+`PROTON_DIR` picks another Proton (default: Proton Experimental if installed, else 11.0; the prefix gets
+that Proton's vkd3d-proton DLLs at each run); `VICTORY_*` and `FLAMINGO_*` settings pass through.
 
 ### Playing
 
@@ -119,6 +120,12 @@ VICTORY_SHADER_OPT=0 VICTORY_WIDE_MERGE=1 FLAMINGO_OSD=1 VICTORY_AMBIENT=0.6 \
 - After a rebuild, if the picture is wrong or the game crashes while compiling, delete
   `~/.local/share/flamingo-fork/cache/pipelines` first: a pipeline cache from another build can
   get in the way.
+- **The game vanishes with no error during the first load** (the log just stops after `shader
+  translated` of a compute shader, often `4e296b1885c37b29`): that is Proton 11.0's vkd3d-proton
+  (g212991fc2) dying while it compiles the pipeline, on NVIDIA 595 and 620 alike. Proton
+  Experimental's (g2576c0b4a) compiles them; it is the default when installed. As a last resort,
+  `VICTORY_SKIP_PIPELINES=<hash>,...` keeps listed shaders' pipelines from ever being compiled
+  (their draws are dropped).
 - On a crash or a hang, the newest log is what to look at first: `device removed`, `no host
   pipeline`, `cannot present`, and the lines before the end.
 - `scripts/linux/run.sh check` confirms the Direct3D 12 device without the game, and prints a

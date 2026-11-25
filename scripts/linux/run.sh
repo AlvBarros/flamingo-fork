@@ -36,6 +36,7 @@ fi
 # itself; without them Wine's built-in d3d12 is used and device creation fails
 # ("Invalid parameter"). Microsoft's d3dcompiler_47 too: see env.sh.
 fork_compiler
+fork_vkd3d
 fork_overrides
 export VICTORY_CACHE_DIR="$(winpath "$FORK_HOME/cache")"
 export VICTORY_DATA_DIR="$(winpath "$FORK_HOME/data")"

@@ -9,5 +9,6 @@
     exit 1
 }
 fork_compiler
+fork_vkd3d
 fork_overrides
 exec "$WINE" "$@"

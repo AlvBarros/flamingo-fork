@@ -12,7 +12,16 @@
 # at $FORK_HOME/d3dcompiler_47.dll, or let this look in your Steam games.
 
 FORK_HOME="${FORK_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/flamingo-fork}"
-PROTON_DIR="${PROTON_DIR:-$HOME/.steam/steam/steamapps/common/Proton 11.0}"
+# Proton Experimental first: Proton 11.0's vkd3d-proton (g212991fc2) takes the
+# process down compiling some of the title's compute pipelines on NVIDIA (no
+# exception, the process is gone: 4e296b1885c37b29 at the first load, more in
+# the first world frame); Experimental's (g2576c0b4a) compiles them all.
+if [ -z "$PROTON_DIR" ]; then
+    for p in "Proton - Experimental" "Proton 11.0"; do
+        PROTON_DIR="$HOME/.steam/steam/steamapps/common/$p"
+        [ -x "$PROTON_DIR/proton" ] && break
+    done
+fi
 export WINEPREFIX="$FORK_HOME/prefix/pfx"
 export WINEDEBUG="${WINEDEBUG:--all}"
 # vkd3d-proton's own pipeline cache, kept out of the working directory.
@@ -50,6 +59,24 @@ fork_compiler() {
         fi
     fi
     FORK_EXTRA_OVERRIDES="d3dcompiler_47=n"
+}
+
+# The prefix keeps the vkd3d-proton it was made with (run.sh starts Wine
+# directly, not through `proton`, which would update it): copy PROTON_DIR's
+# d3d12.dll and d3d12core.dll in when they differ, so changing PROTON_DIR
+# changes the vkd3d-proton that runs.
+fork_vkd3d() {
+    src="$PROTON_DIR/files/lib/wine/vkd3d-proton/x86_64-windows"
+    dst="$WINEPREFIX/drive_c/windows/system32"
+    [ -d "$src" ] && [ -d "$dst" ] || return 0
+    for dll in d3d12.dll d3d12core.dll; do
+        if [ -f "$src/$dll" ] && ! cmp -s "$src/$dll" "$dst/$dll"; then
+            # Replaced, not written through: Proton ships them read-only, and
+            # a symlink into the Proton install must not be written into.
+            rm -f "$dst/$dll" && install -m 755 "$src/$dll" "$dst/$dll" &&
+                echo "fork: $dll from $(cut -d' ' -f2- "$src/../version" 2>/dev/null || echo "$src")" >&2
+        fi
+    done
 }
 
 fork_overrides() {
