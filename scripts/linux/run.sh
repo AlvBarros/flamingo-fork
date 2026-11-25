@@ -51,7 +51,12 @@ check)
     ;;
 prebuild)
     [ -n "$2" ] || { echo "usage: $0 prebuild /path/to/shaders.rpf" >&2; exit 2; }
-    "$WINE" "$EXE" translate --cache --pipelines --jobs "${JOBS:-8}" "$(winpath "$2")" 2>&1 | tee "$LOG"
+    # Translates every shader into the run's cache (nothing is compiled on
+    # the GPU). The translation depends on the host: the wave width and the
+    # view heap's null slot a play log names ("host wave lanes", "host view
+    # heaps hold N views": the null slot is N-1). Defaults: an RTX 4070.
+    VICTORY_HOST_WAVE="${VICTORY_HOST_WAVE:-32}" VICTORY_VIEW_LIMIT="${VICTORY_VIEW_LIMIT:-999999}" \
+        "$WINE" "$EXE" translate --warm all --jobs "${JOBS:-8}" "$(winpath "$2")" 2>&1 | tee "$LOG"
     ;;
 play)
     [ -n "$2" ] || { echo "usage: $0 play /path/to/<the title's exe> [options]" >&2; exit 2; }
