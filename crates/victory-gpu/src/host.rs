@@ -8424,6 +8424,9 @@ impl Meter {
                 shaders: [cached, translated, failed],
                 pipelines: [made, crate::pipeline::making(), unmade],
                 dropped,
+                copies: [copy_ms, copy_mb],
+                textures: [texture_ms, texture_mb],
+                back_mb,
             });
         }
         let indirect = crate::list::take_indirect() as f64 / frames;
