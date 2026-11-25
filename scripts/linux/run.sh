@@ -20,7 +20,7 @@ set -e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 # What the caller's environment already had, to tell its settings from ours.
 FORK_CALLER_ENV="
-$(env | grep -E '^(VICTORY|FLAMINGO|VKD3D|DXVK|MANGOHUD)[A-Z0-9_]*=' | cut -d= -f1)
+$(env | grep -E '^(VICTORY|FLAMINGO|VKD3D|DXVK|MANGOHUD|__GL)[A-Z0-9_]*=' | cut -d= -f1)
 "
 
 # KEY=value lines; nothing in them is run. play.local.env is read first and a
@@ -64,6 +64,7 @@ EXE="${FORK_EXE:-$ROOT/target/x86_64-pc-windows-msvc/release/victory.exe}"
 [ -f "$EXE" ] || { echo "no $EXE: run scripts/linux/build.sh first" >&2; exit 1; }
 LOGS="${FORK_LOGS:-$ROOT/logs}"
 mkdir -p "$FORK_HOME/cache" "$FORK_HOME/data" "$FORK_HOME/prefix" "$LOGS"
+[ -n "$__GL_SHADER_DISK_CACHE_PATH" ] && mkdir -p "$__GL_SHADER_DISK_CACHE_PATH"
 
 # A Windows path for a Linux one (Wine maps / to Z:).
 winpath() { printf 'Z:%s' "$(realpath "$1")" | tr / '\\'; }
@@ -101,7 +102,7 @@ fork_header() {
         [ -n "$FORK_RUN_WHAT" ] && echo "$FORK_RUN_WHAT"
         echo "settings   (source in brackets; the environment wins over play.local.env over play.env)"
         printf '%s\n' "$FORK_SETTINGS" | sed '/^$/d; s/^/  /'
-        others=$(env | grep -E '^(VICTORY|FLAMINGO|VKD3D|DXVK|MANGOHUD)[A-Z0-9_]*=' | sort |
+        others=$(env | grep -E '^(VICTORY|FLAMINGO|VKD3D|DXVK|MANGOHUD|__GL)[A-Z0-9_]*=' | sort |
             while IFS= read -r kv; do
                 case "$FORK_SETTINGS" in *"
 ${kv%%=*}="*) continue ;; esac
