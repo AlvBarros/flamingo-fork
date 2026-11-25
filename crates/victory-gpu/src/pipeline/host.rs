@@ -1352,6 +1352,12 @@ mod tests {
             eprintln!("no host depth bounds support; skipped");
             return;
         }
+        // WARP says it has the test and does not filter by it (the CI's
+        // runners, which have no GPU, failed here).
+        if crate::host::on_software_adapter(&host.device) {
+            eprintln!("software adapter: depth bounds not carried out; skipped");
+            return;
+        }
         let Some(dxc) = dxc() else {
             eprintln!("no PC dxc.exe; skipped");
             return;

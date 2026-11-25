@@ -716,6 +716,23 @@ fn create() -> windows::core::Result<Host> {
     }
 }
 
+/// Whether `device` runs on a software adapter (WARP: the CI runners have no
+/// GPU), which reports some features it does not carry out.
+#[cfg(test)]
+pub(crate) fn on_software_adapter(device: &ID3D12Device) -> bool {
+    // SAFETY: plain DXGI adapter queries.
+    unsafe {
+        let luid = device.GetAdapterLuid();
+        let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) else {
+            return false;
+        };
+        let Ok(adapter) = factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid) else {
+            return false;
+        };
+        adapter.GetDesc1().is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+    }
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
