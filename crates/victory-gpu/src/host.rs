@@ -840,6 +840,167 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 
 #[cfg(test)]
 mod tests {
+    /// A range declared written again is kept once until a title copy or
+    /// title work, and a submission groups the ranges per copy, each once,
+    /// in the order first declared (Belobug #29).
+    #[test]
+    fn gpu_writes_are_declared_once_until_title_memory_changes() {
+        use std::sync::Arc;
+        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+        let Some(host) = super::host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let shadow = |host: &super::Host| {
+            let (buffer, data): (ID3D12Resource, *mut u8) = host.shared_buffer(64 << 10)?;
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            Some(Arc::new(crate::shadow::Shadow::for_test(buffer, data, gpu, 64 << 10)))
+        };
+        let (Some(a), Some(b)) = (shadow(host), shadow(host)) else { return };
+        let writes = |list: &super::HostList| {
+            list.deferred().copies.iter().filter(|s| matches!(s, super::Step::GpuWrite(..))).count()
+        };
+        list.defer_gpu_write(&a, 0, 256);
+        list.defer_gpu_write(&b, 512, 64);
+        list.defer_gpu_write(&a, 0, 256);
+        list.defer_gpu_write(&a, 1024, 16);
+        assert_eq!(writes(&list), 3, "a repeated range is declared once");
+        let grouped = super::declared_writes(&[&list, &list]);
+        assert_eq!(grouped.len(), 2);
+        assert!(Arc::ptr_eq(&grouped[0].0, &a) && Arc::ptr_eq(&grouped[1].0, &b));
+        assert_eq!(grouped[0].1, vec![(0, 256), (1024, 1040)]);
+        assert_eq!(grouped[1].1, vec![(512, 576)]);
+        // A title copy: the same range is declared again after it.
+        let (mut x, y) = ([0u8; 4], [1u8; 4]);
+        list.defer_copy(x.as_mut_ptr(), y.as_ptr(), 4);
+        list.defer_gpu_write(&a, 0, 256);
+        assert_eq!(writes(&list), 4, "declared again after a title copy");
+        list.defer(|| {});
+        list.defer_gpu_write(&a, 0, 256);
+        assert_eq!(writes(&list), 5, "declared again after title work");
+        assert_eq!(super::declared_writes(&[&list])[0].1, vec![(0, 256), (1024, 1040)]);
+    }
+
+    /// The same title bytes asked for again are the same upload memory, one
+    /// fill, until a title copy or title work (Belobug #24).
+    #[test]
+    fn a_fill_is_shared_until_title_memory_changes() {
+        let Some(host) = super::host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let fills = |list: &super::HostList| {
+            list.deferred().copies.iter().filter(|s| matches!(s, super::Step::Fill(..))).count()
+        };
+        let title = vec![7u8; 4096];
+        let first = list.fill_scratch(title.as_ptr(), 300).expect("list scratch");
+        assert_eq!(list.fill_scratch(title.as_ptr(), 300), Some(first));
+        assert_eq!(fills(&list), 1, "one fill for two asks");
+        let other = list.fill_scratch(title[512..].as_ptr(), 300).unwrap();
+        assert_ne!(other, first);
+        assert_eq!(fills(&list), 2);
+        let (mut x, y) = ([0u8; 4], [1u8; 4]);
+        list.defer_copy(x.as_mut_ptr(), y.as_ptr(), 4);
+        assert_ne!(list.fill_scratch(title.as_ptr(), 300), Some(first), "filled again after a title copy");
+        assert_eq!(fills(&list), 3);
+        list.defer(|| {});
+        list.fill_scratch(title.as_ptr(), 300).unwrap();
+        assert_eq!(fills(&list), 4, "filled again after title work");
+    }
+
+    /// Staging for a buffer-to-texture copy comes from the list's scratch
+    /// chunks at a 512-byte aligned offset past other scratch, and a texture
+    /// copied from it as a placed footprint there holds its bytes (Belobug
+    /// #30).
+    #[test]
+    fn a_texture_copies_from_pooled_staging_at_an_offset() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+        let Some(host) = super::host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        list.scratch(10).expect("list scratch");
+        let (buffer, at, staging) = list.upload(1024).expect("pooled staging");
+        assert!(at != 0 && at % 512 == 0, "offset {at}");
+        let pattern: Vec<u8> = (0..1024u32).map(|i| (i * 7 + 3) as u8).collect();
+        // SAFETY: 1024 bytes of mapped upload memory the list holds.
+        unsafe { std::ptr::copy_nonoverlapping(pattern.as_ptr(), staging, 1024) };
+        let make = |heap: D3D12_HEAP_TYPE, desc: &D3D12_RESOURCE_DESC, state| {
+            let mut made: Option<ID3D12Resource> = None;
+            let props = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
+            // SAFETY: plain creation.
+            unsafe { host.device.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, desc, state, None, &mut made) }
+                .unwrap();
+            made.unwrap()
+        };
+        let texture = make(
+            D3D12_HEAP_TYPE_DEFAULT,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 4,
+                Height: 4,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        let readback = make(
+            D3D12_HEAP_TYPE_READBACK,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 1024,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        let rows = |b: &ID3D12Resource, offset: u64| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(b) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                    Offset: offset,
+                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        Width: 4,
+                        Height: 4,
+                        Depth: 1,
+                        RowPitch: 256,
+                    },
+                },
+            },
+        };
+        let whole = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+        };
+        // SAFETY: an open list and live resources in the states named.
+        unsafe {
+            let l = &list.list;
+            l.CopyTextureRegion(&whole, 0, 0, 0, &rows(&buffer, at), None);
+            l.ResourceBarrier(&[super::transition(&texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            l.CopyTextureRegion(&rows(&readback, 0), 0, 0, 0, &whole, None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the copies finished (execute waits); 1024 bytes.
+        let read = unsafe {
+            readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 1024 }), Some(&mut mapped)).unwrap();
+            std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
+        };
+        for row in 0..4 {
+            let r = row * 256;
+            assert_eq!(read[r..r + 16], pattern[r..r + 16], "row {row}");
+        }
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
@@ -1522,7 +1683,7 @@ impl Drop for Counted {
 /// A chunk of upload memory for lists' scratch data: the buffer, its
 /// mapping and its host GPU address.
 struct Chunk {
-    _buffer: ID3D12Resource,
+    buffer: ID3D12Resource,
     data: usize,
     gpu: u64,
 }
@@ -1621,7 +1782,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
     Some(Chunk {
-        _buffer: buffer,
+        buffer,
         data: data as usize,
         gpu,
     })
@@ -2124,6 +2285,16 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Buffer ranges declared written by shaders since the last title copy
+    /// (host copy, address, bytes): declaring them again would change
+    /// nothing (Belobug/VIctory-Belobug-AMD #29).
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// Upload memory filled from title memory since the last title copy
+    /// (source, bytes): its host GPU address, which a second fill would find
+    /// holding the same bytes (Belobug #24).
+    filled: std::collections::HashMap<(usize, usize), u64>,
+    /// The host pipelines `bind_pipeline` kept, by address (Belobug #25).
+    bound: std::collections::HashSet<usize>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2177,6 +2348,9 @@ impl Deferred {
             upload_bytes,
             kept,
             refreshed,
+            gpu_written,
+            filled,
+            bound,
             textures,
             writes,
             backs,
@@ -2190,6 +2364,9 @@ impl Deferred {
         *upload_bytes = 0;
         kept.clear();
         refreshed.clear();
+        gpu_written.clear();
+        filled.clear();
+        bound.clear();
         textures.clear();
         writes.clear();
         backs.clear();
@@ -3821,18 +3998,33 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
 /// One list's lock at a time: a submission may name a list twice.
 fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
+    group_writes(runs, |_| true)
+}
+
+/// The distinct ranges the shaders of `runs` declared written, per host
+/// copy that `keep` takes, in the order first declared. Hashed: a frame
+/// declares thousands of ranges, and finding each among those before was a
+/// linear search (Belobug/VIctory-Belobug-AMD #29).
+fn group_writes(runs: &[&HostList], keep: impl Fn(&crate::shadow::Shadow) -> bool) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
+    let mut at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut seen: std::collections::HashSet<(usize, usize, usize)> = std::collections::HashSet::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+            if let Step::GpuWrite(shadow, address, len) = step
+                && keep(shadow)
+            {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
                 let range = (*address, *address + *len);
-                match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                    Some((_, ranges)) => {
-                        if !ranges.contains(&range) {
-                            ranges.push(range);
-                        }
+                if !seen.insert((key, range.0, range.1)) {
+                    continue;
+                }
+                match at.get(&key) {
+                    Some(&i) => back[i].1.push(range),
+                    None => {
+                        at.insert(key, back.len());
+                        back.push((shadow.clone(), vec![range]));
                     }
-                    None => back.push((shadow.clone(), vec![range])),
                 }
             }
         }
@@ -4327,24 +4519,8 @@ impl Host {
             return None;
         }
         // The ranges this submission's shaders may write, per copy.
-        let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
-        for list in runs {
-            for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && shadow.carded()
-                {
-                    let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
-                            }
-                        }
-                        None => declared.push((shadow.clone(), vec![range])),
-                    }
-                }
-            }
-        }
+        let declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> =
+            group_writes(runs, |s| s.carded());
         // With the relay: the order of the queue is held from here until
         // what is taken is on the queue, and the taking is numbered.
         let mut order = relay().then(|| QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner()));
@@ -6942,14 +7118,34 @@ impl HostList {
             && self.twins.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
-    /// Notes a pipeline the list binds; called where it is bound.
-    pub(crate) fn used_pipeline(&self, name: &str) {
-        {
+    /// Notes a pipeline the list binds; called where it is bound. It and its
+    /// root signature are kept until the list is reset (the title may
+    /// release them before it submits) and named, the first time only: the
+    /// list keeps the first, so its address names the same pipeline from
+    /// then on (Belobug/VIctory-Belobug-AMD #25: one lookup instead of two
+    /// QueryInterface calls, three locks and a name search per switch). The
+    /// card meter still marks every switch.
+    pub(crate) fn bind_pipeline(&self, p: &crate::pipeline::host::HostPipeline) {
+        let first = {
+            let mut deferred = self.deferred();
+            let first = deferred.bound.insert(p.pso.as_raw() as usize);
+            if first {
+                if let Ok(pso) = p.pso.cast::<windows::core::IUnknown>() {
+                    deferred.kept.push(pso);
+                }
+                if let Ok(root) = p.root.cast::<windows::core::IUnknown>() {
+                    deferred.kept.push(root);
+                }
+            }
+            first
+        };
+        if first {
             let mut pipelines = self.pipelines.lock().unwrap_or_else(|e| e.into_inner());
-            if !pipelines.contains(name) {
-                pipelines.insert(name.to_owned());
+            if !pipelines.contains(&p.name) {
+                pipelines.insert(p.name.clone());
             }
         }
+        let name = p.name.as_str();
         if crate::cardmeter::pipelines() {
             // The pipeline before it ends here on the card's clock.
             crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
@@ -6959,6 +7155,21 @@ impl HostList {
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The host GPU address of `len` bytes of upload memory holding the
+    /// title memory at `src` as of the list's submission: one copy for every
+    /// ask until a title copy or title work intervenes (Belobug #24: a root
+    /// constant buffer not 256-byte aligned, bound by draw after draw).
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        if let Some(&gpu) = self.deferred().filled.get(&key) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
@@ -6981,6 +7192,8 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
+        deferred.filled.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7017,9 +7230,16 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        // Once until a title copy or title work (Belobug #29): a range a
+        // dispatch after dispatch declares again changes nothing, and each
+        // step costs a flush and a snapshot at submission.
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -7045,20 +7265,30 @@ impl HostList {
             .any(|(at, what, n)| *at == address && *n >= bytes && matches!(what, crate::queue::Written::Value(v) if holds(*v)))
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
-        Some((buffer, data))
+    /// `size` bytes of mapped upload memory, 512-byte aligned for a placed
+    /// footprint, alive until the list is reset: the buffer, the offset in
+    /// it and the CPU pointer. From the list's scratch chunks, not a
+    /// committed buffer created and mapped per copy (Belobug/VIctory-
+    /// Belobug-AMD #30).
+    pub(crate) fn upload(&self, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_in(size, 512, |buffer, at, _, data| (buffer.clone(), at, data))
     }
 
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
+    }
+
+    /// `len` bytes of upload memory at a multiple of `align` (a power of two
+    /// up to 64 KiB) until the list is reset, handed to `f` with the buffer,
+    /// the offset in it, the host GPU address and the CPU pointer.
+    fn scratch_in<R>(
+        &self,
+        len: u64,
+        align: u64,
+        f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Option<R> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -7067,12 +7297,13 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let made = f(&buffer, 0, gpu, data);
             self.deferred().hold_upload(buffer, len);
-            return Some((gpu, data));
+            return Some(made);
         }
         // The chunk in use while `len` fits in what is left of it, else the
         // next one (a list's first chunk may be a small one).
-        while s.current < s.chunks.len() && s.used + len > s.chunks[s.current].1 {
+        while s.current < s.chunks.len() && s.used.next_multiple_of(align) + len > s.chunks[s.current].1 {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -7085,10 +7316,13 @@ impl HostList {
             s.chunks.push((chunk, size));
             s.used = 0;
         }
-        let (data, gpu) = (s.chunks[s.current].0.data, s.chunks[s.current].0.gpu);
-        let at = s.used;
-        s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let chunk = &s.chunks[s.current].0;
+        // Chunks are upload buffers (64 KiB aligned): an offset at a
+        // multiple of `align` is an address at one.
+        let at = s.used.next_multiple_of(align);
+        let made = f(&chunk.buffer, at, chunk.gpu + at, (chunk.data + at as usize) as *mut u8);
+        s.used = at + len;
+        Some(made)
     }
 
     /// Flamingo ([`crate::shadow::card_fills`]): `len` bytes of title memory
@@ -7357,8 +7591,11 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.gpu_written.clear();
+        deferred.filled.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
