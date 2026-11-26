@@ -872,15 +872,21 @@ fn add_stale() -> u64 {
     N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
-/// Flamingo: the hot set's switches, `None` when it is off
-/// (`VICTORY_HOT_SET=0`): after how many frames in a row a view block found
-/// written stays unguarded (`VICTORY_HOT_AFTER`, 3), and for how many frames
-/// before it is guarded again to see whether it still is (`VICTORY_HOT_FRAMES`,
-/// 120).
+/// Flamingo: the hot set's switches, `None` when it is off: opt-in,
+/// `VICTORY_HOT_SET=1` (or `alt`); after how many frames in a row a view block
+/// found written stays unguarded (`VICTORY_HOT_AFTER`, 3), and for how many
+/// frames before it is guarded again to see whether it still is
+/// (`VICTORY_HOT_FRAMES`, 120).
+///
+/// Off by default: measured on frames that draw (Proton, RTX 4070, opening
+/// cutscene, one run, twenty seconds on and off in turn, 349 and 387 frames
+/// of 1,000 draws or more), it cut protection changes 2,215 -> 946 a frame but
+/// copied 159 -> 385 MB and refreshed textures 614 -> 1,148 ms: frames 6% slower
+/// (median 569 -> 603 ms).
 fn hot_params() -> Option<(u8, u64)> {
     static P: std::sync::OnceLock<Option<(u8, u64)>> = std::sync::OnceLock::new();
     *P.get_or_init(|| {
-        if std::env::var_os("VICTORY_HOT_SET").is_some_and(|v| v == "0") {
+        if !std::env::var_os("VICTORY_HOT_SET").is_some_and(|v| v == "1" || v == "alt") {
             return None;
         }
         let num = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &u64| n > 0).unwrap_or(default);
@@ -921,13 +927,18 @@ fn hot_now(g: &mut Guards) -> bool {
 /// that covers it reports it written and its copies take it. That is
 /// always safe (a copy of unchanged bytes); what it costs is copies.
 fn stays_hot(g: &mut Guards, block: usize, frame: u64) -> bool {
-    use crate::framelog::{T, add};
     let Some((after, frames)) = hot_params() else {
         return false;
     };
     if !hot_now(g) {
         return false;
     }
+    stays_hot_with(g, block, frame, after, frames)
+}
+
+/// [`stays_hot`] with its switches given.
+fn stays_hot_with(g: &mut Guards, block: usize, frame: u64, after: u8, frames: u64) -> bool {
+    use crate::framelog::{T, add};
     if let Some(&since) = g.hot.get(&block) {
         if frame.saturating_sub(since) < frames {
             add(T::HotKept, 1);
@@ -2747,9 +2758,8 @@ mod tests {
     /// count twice, and a gap of more than two frames starts over.
     #[test]
     fn hot_set_takes_blocks_written_frame_after_frame() {
-        let Some((after, frames)) = hot_params() else {
-            return;
-        };
+        let (after, frames) = (3u8, 120u64);
+        let stays_hot = |g: &mut Guards, block: usize, frame: u64| stays_hot_with(g, block, frame, after, frames);
         let mut g = Guards {
             protected: BTreeSet::new(),
             clean: BTreeSet::new(),

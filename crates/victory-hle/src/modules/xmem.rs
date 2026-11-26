@@ -832,9 +832,9 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
             // here): made one, or the run is mapped page by page below.
             // SAFETY: acts only on placeholders; fails harmlessly unless
             // `[at, at + run pages)` is exactly whole adjacent placeholders.
-            unsafe {
+            timed(true, || unsafe {
                 VirtualFree(at as *mut c_void, run * PAGE, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
-            }
+            });
             if map_quiet(&mut physical, at, run * PAGE, first.clone()) {
                 i += run;
                 continue;
@@ -854,6 +854,24 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// Flamingo: a call made while remapping, timed into the frame log: a
+/// Windows call (`os`), or the GPU side told (what of the remapping's time
+/// is Windows', under Wine, and what is ours).
+fn timed<R>(os: bool, call: impl FnOnce() -> R) -> R {
+    use victory_gpu::framelog::{T, add};
+    let started = std::time::Instant::now();
+    let r = call();
+    let ns = started.elapsed().as_nanos() as u64;
+    if os {
+        add(T::RemapOsCalls, 1);
+        add(T::RemapOsNs, ns);
+    } else {
+        add(T::RemapNotes, 1);
+        add(T::RemapNoteNs, ns);
+    }
+    r
+}
+
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
@@ -871,12 +889,14 @@ fn map_logged(physical: &mut Physical, base: usize, len: usize, slice: Slice, lo
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
     let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
-        MapViewOfFile3(
+        timed(true, || {
+            VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            )
+        });
+        timed(true, || MapViewOfFile3(
             slice.section.0,
             GetCurrentProcess(),
             base as *const c_void,
@@ -886,7 +906,7 @@ fn map_logged(physical: &mut Physical, base: usize, len: usize, slice: Slice, lo
             PAGE_READWRITE,
             std::ptr::null_mut(),
             0,
-        )
+        ))
     };
     if view.Value as usize != base {
         if !log {
@@ -906,9 +926,9 @@ fn map_logged(physical: &mut Physical, base: usize, len: usize, slice: Slice, lo
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
+    timed(false, || victory_gpu::title_memory_remapped(base, len));
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    timed(false, || victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64));
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
     }
@@ -999,9 +1019,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
+        timed(false, || victory_gpu::title_memory_remapped(at, size));
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        timed(true, || unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1009,7 +1029,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 },
                 MEM_PRESERVE_PLACEHOLDER,
             )
-        };
+        });
         if at < base {
             map(physical, at, base - at, slice.clone());
         }

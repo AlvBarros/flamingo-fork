@@ -122,6 +122,14 @@ pub enum T {
     /// of them the ones whose bytes had changed with no write reported.
     VerifyChecked,
     VerifyStale,
+    /// Of the remapping (`Remaps`, `RemapUs`): the Windows calls it makes
+    /// (placeholders split and coalesced, views mapped and unmapped), and the
+    /// GPU side told of it (`title_memory_remapped`, `title_memory_view`):
+    /// calls and nanoseconds of each, summed over threads.
+    RemapOsCalls,
+    RemapOsNs,
+    RemapNotes,
+    RemapNoteNs,
     Count,
 }
 
@@ -434,7 +442,7 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
+         readers; Windows calls {:.0} {:.1} ms, the GPU side told {:.0} {:.1} ms) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0} \
          | memory watch, all threads: {:.0} write-watch askings ({:.0} refused) {:.1} ms over {:.0} MB; {:.0} protection changes \
@@ -478,6 +486,10 @@ fn text(f: &Frame) -> String {
         t(T::Remaps),
         ms(T::RemapUs),
         ms(T::RemapWaitUs),
+        t(T::RemapOsCalls),
+        t(T::RemapOsNs) / 1e6,
+        t(T::RemapNotes),
+        t(T::RemapNoteNs) / 1e6,
         s(S_PIPELINES_MADE),
         s(S_PIPELINES_LOADED),
         ms(T::PipelineWaitUs),
