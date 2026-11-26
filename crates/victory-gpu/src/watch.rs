@@ -407,6 +407,29 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     ask_run(j, b);
 }
 
+/// Flamingo: one system call of the memory watch, counted and timed into
+/// the frame log's totals `calls` and `ns` (`crate::framelog`, printed with
+/// `VICTORY_FRAME_LOG=1`).
+pub(crate) fn sys<R>(calls: crate::framelog::T, ns: crate::framelog::T, call: impl FnOnce() -> R) -> R {
+    let started = std::time::Instant::now();
+    let r = call();
+    crate::framelog::add(calls, 1);
+    crate::framelog::add(ns, started.elapsed().as_nanos() as u64);
+    r
+}
+
+/// Flamingo: a write-watch asking of `bytes` bytes for the frame log,
+/// timed, with whether the kernel refused it.
+fn ask_watch(bytes: usize, call: impl FnOnce() -> u32) -> bool {
+    use crate::framelog::{T, add};
+    let failed = sys(T::WatchAsks, T::WatchNs, call) != 0;
+    add(T::WatchBytes, bytes as u64);
+    if failed {
+        add(T::WatchRefused, 1);
+    }
+    failed
+}
+
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
@@ -418,17 +441,19 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
+    let failed = ask_watch((last - first) * PAGE, || {
+        // SAFETY: the answer buffer holds `count` entries.
+        unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        }
+    });
     if failed {
         return false;
     }
@@ -497,18 +522,20 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool, since: u64) -> Opt
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
     let known_view = guarded && known_view(first * PAGE);
-    // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
-        || unsafe {
-            GetWriteWatch(
-                WRITE_WATCH_FLAG_RESET,
-                (first * PAGE) as *const _,
-                (last - first) * PAGE,
-                j.found.as_mut_ptr().cast(),
-                &mut count,
-                &mut granularity,
-            )
-        } != 0;
+        || ask_watch((last - first) * PAGE, || {
+            // SAFETY: the answer buffer holds `count` entries.
+            unsafe {
+                GetWriteWatch(
+                    WRITE_WATCH_FLAG_RESET,
+                    (first * PAGE) as *const _,
+                    (last - first) * PAGE,
+                    j.found.as_mut_ptr().cast(),
+                    &mut count,
+                    &mut granularity,
+                )
+            }
+        });
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {
@@ -910,18 +937,20 @@ fn in_placeholder(block: usize) -> bool {
     const PLACEHOLDER: u32 = 1 << 8;
     // SAFETY: plain data filled in by the query.
     let mut info: WIN32_MEMORY_REGION_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size; the returned size is
-    // optional. Free memory fails the query: no placeholder.
-    let ok = unsafe {
-        QueryVirtualMemoryInformation(
-            GetCurrentProcess(),
-            (block * BLOCK) as *const _,
-            MemoryRegionInfo,
-            (&raw mut info).cast(),
-            size_of_val(&info),
-            std::ptr::null_mut(),
-        )
-    } != 0;
+    let ok = sys(crate::framelog::T::QueryCalls, crate::framelog::T::QueryNs, || {
+        // SAFETY: a valid out pointer of the right size; the returned size
+        // is optional. Free memory fails the query: no placeholder.
+        unsafe {
+            QueryVirtualMemoryInformation(
+                GetCurrentProcess(),
+                (block * BLOCK) as *const _,
+                MemoryRegionInfo,
+                (&raw mut info).cast(),
+                size_of_val(&info),
+                std::ptr::null_mut(),
+            )
+        }
+    }) != 0;
     // SAFETY: the flags word of the union, filled in by the query.
     ok && unsafe { info.Anonymous.Flags } & PLACEHOLDER != 0
 }
@@ -1129,8 +1158,10 @@ fn is_view(start: usize, end: usize) -> bool {
     loop {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let n = sys(crate::framelog::T::QueryCalls, crate::framelog::T::QueryNs, || {
+            // SAFETY: a valid out pointer of the right size.
+            unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) }
+        });
         if n == 0 {
             return false;
         }
@@ -1203,15 +1234,17 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
         }
         let n = run_end - run_start;
         let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
-        let set = unsafe {
-            VirtualProtect(
-                (run_start * BLOCK) as *const _,
-                n * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            )
-        };
+        let set = sys(crate::framelog::T::ProtectCalls, crate::framelog::T::ProtectNs, || {
+            // SAFETY: title view memory; only its protection changes.
+            unsafe {
+                VirtualProtect(
+                    (run_start * BLOCK) as *const _,
+                    n * BLOCK,
+                    PAGE_READONLY,
+                    &mut old,
+                )
+            }
+        });
         if set != 0 {
             g.protected.extend(run_start..run_end);
             if view_known() {
@@ -1257,8 +1290,11 @@ fn protect_alias(g: &mut Guards, block: usize) {
         return;
     }
     let mut old = 0;
-    // SAFETY: title view memory; only its protection changes.
-    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+    let set = sys(crate::framelog::T::ProtectCalls, crate::framelog::T::ProtectNs, || {
+        // SAFETY: title view memory; only its protection changes.
+        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) }
+    });
+    if set != 0 {
         g.protected.insert(block);
         if view_known() {
             g.viewed.insert(block);
@@ -1271,15 +1307,17 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
         let mut old = 0;
-        // SAFETY: title view memory; only its protection changes.
-        unsafe {
-            VirtualProtect(
-                (from * BLOCK) as *const _,
-                (to - from) * BLOCK,
-                PAGE_READONLY,
-                &mut old,
-            ) != 0
-        }
+        sys(crate::framelog::T::ProtectCalls, crate::framelog::T::ProtectNs, || {
+            // SAFETY: title view memory; only its protection changes.
+            unsafe {
+                VirtualProtect(
+                    (from * BLOCK) as *const _,
+                    (to - from) * BLOCK,
+                    PAGE_READONLY,
+                    &mut old,
+                ) != 0
+            }
+        })
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
@@ -1330,8 +1368,10 @@ fn uncommitted_end(block: usize) -> usize {
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    let n = sys(crate::framelog::T::QueryCalls, crate::framelog::T::QueryNs, || {
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) }
+    });
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
     } else {
@@ -1393,24 +1433,26 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         }
         let n = run_end - run_start;
         let mut old = 0;
-        // SAFETY: blocks we made read-only.
-        let set = unsafe {
-            VirtualProtect(
-                (run_start * BLOCK) as *const _,
-                n * BLOCK,
-                PAGE_READWRITE,
-                &mut old,
-            )
-        };
+        let set = sys(crate::framelog::T::ProtectCalls, crate::framelog::T::ProtectNs, || {
+            // SAFETY: blocks we made read-only.
+            unsafe {
+                VirtualProtect(
+                    (run_start * BLOCK) as *const _,
+                    n * BLOCK,
+                    PAGE_READWRITE,
+                    &mut old,
+                )
+            }
+        });
         if set == 0 && n > 1 {
             // A run can span a placeholder and the views over it, which the
             // kernel only lets be given back one region at a time.
             for block in run_start..run_end {
                 let mut old = 0;
-                // SAFETY: a block we made read-only.
-                unsafe {
-                    VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
-                };
+                sys(crate::framelog::T::ProtectCalls, crate::framelog::T::ProtectNs, || {
+                    // SAFETY: a block we made read-only.
+                    unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) }
+                });
             }
         }
     }
@@ -1812,8 +1854,10 @@ fn writable(at: usize) -> bool {
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    let n = sys(crate::framelog::T::QueryCalls, crate::framelog::T::QueryNs, || {
+        // SAFETY: a valid out pointer of the right size.
+        unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) }
+    });
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 

@@ -100,6 +100,19 @@ pub enum T {
     WorkerSlow,
     RecordLooks,
     RecordSlow,
+    /// The memory watch's system calls (`crate::watch`), on every thread:
+    /// write-watch askings (and of them the refused ones, and the bytes
+    /// asked about), protection changes, and region queries, each with
+    /// its nanoseconds. Under Wine these are dear: a frame of the opening
+    /// cutscene spent 1.3 s "asking the write watch and the guards".
+    WatchAsks,
+    WatchRefused,
+    WatchBytes,
+    WatchNs,
+    ProtectCalls,
+    ProtectNs,
+    QueryCalls,
+    QueryNs,
     Count,
 }
 
@@ -414,7 +427,9 @@ fn text(f: &Frame) -> String {
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
          readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
-         draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
+         draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0} \
+         | memory watch, all threads: {:.0} write-watch askings ({:.0} refused) {:.1} ms over {:.0} MB; {:.0} protection changes \
+         {:.1} ms; {:.0} region queries {:.1} ms",
         f.us / 1e3,
         (s(S_THREAD_USER) + s(S_THREAD_KERNEL)) / 1e3,
         s(S_THREAD_USER) / 1e3,
@@ -473,6 +488,14 @@ fn text(f: &Frame) -> String {
         t(T::WorkerLooks),
         t(T::RecordSlow),
         t(T::RecordLooks),
+        t(T::WatchAsks),
+        t(T::WatchRefused),
+        t(T::WatchNs) / 1e6,
+        t(T::WatchBytes) / 1e6,
+        t(T::ProtectCalls),
+        t(T::ProtectNs) / 1e6,
+        t(T::QueryCalls),
+        t(T::QueryNs) / 1e6,
     )
 }
 
