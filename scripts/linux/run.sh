@@ -157,7 +157,10 @@ play)
     # No options given: FORK_PLAY_ARGS (word-split on purpose).
     # shellcheck disable=SC2086
     [ $# -gt 0 ] || set -- $FORK_PLAY_ARGS
-    unset VICTORY_KEYS VICTORY_CAPTURE VICTORY_CAPTURE_FRAMES VICTORY_DUMP_TARGETS
+    unset VICTORY_CAPTURE VICTORY_CAPTURE_FRAMES VICTORY_DUMP_TARGETS
+    # FORK_KEYS (play.env): scripted presses, `<seconds>:<key>,...` after input
+    # starts (Enter is the pad's A), for runs nobody watches; else none.
+    if [ -n "$FORK_KEYS" ]; then export VICTORY_KEYS="$FORK_KEYS"; else unset VICTORY_KEYS; fi
     FORK_RUN_WHAT="game       $exe_path
 run args   $*"
     fork_header play

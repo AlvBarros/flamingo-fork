@@ -28,5 +28,9 @@ ln -sf "$TOOLS/llvm-ar" "$FORK_HOME/bin/llvm-lib"
 ln -sf "$TOOLS/llvm-ar" "$FORK_HOME/bin/llvm-ar"
 ln -sf "$TOOLS/rust-lld" "$FORK_HOME/bin/lld-link"
 
-PATH="$FORK_HOME/bin:$PATH" cargo xwin build --release --locked -p victory --target "$TARGET" "$@"
+# The scripted keys (`VICTORY_KEYS`, run.sh's FORK_KEYS) are built in: they do
+# nothing unless set, and let a timing run press through the start screen
+# alone. FORK_FEATURES="" builds without them.
+FEATURES="${FORK_FEATURES-victory-hle/keys}"
+PATH="$FORK_HOME/bin:$PATH" cargo xwin build --release --locked -p victory --target "$TARGET" ${FEATURES:+--features "$FEATURES"} "$@"
 echo "built: $ROOT/target/$TARGET/release/victory.exe"
