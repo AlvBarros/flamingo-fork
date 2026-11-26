@@ -797,6 +797,28 @@ fn hot_params() -> Option<(u8, u64)> {
     })
 }
 
+/// Whether the hot set acts now. `VICTORY_HOT_SET=alt`: twenty seconds with,
+/// twenty without, in turn, each change said in the log, for measuring it in
+/// one scene (as `VICTORY_VIEW_KNOWN=alt`); at each change to "without" the
+/// set is emptied, so its blocks are guarded again from then on.
+fn hot_now(g: &mut Guards) -> bool {
+    static ALT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ALT.get_or_init(|| std::env::var_os("VICTORY_HOT_SET").is_some_and(|v| v == "alt")) {
+        return true;
+    }
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+        if !on {
+            g.hot.clear();
+            g.hot_seen.clear();
+        }
+        tracing::info!("hot set from now (VICTORY_HOT_SET=alt): {}", if on { "ON" } else { "off" });
+    }
+    on
+}
+
 /// Flamingo: the hot set. A view block the title writes every frame went
 /// round the guard's whole cycle every frame: made read-only, a fault at
 /// the title's write, given write access back, made read-only again at the
@@ -812,6 +834,9 @@ fn stays_hot(g: &mut Guards, block: usize, frame: u64) -> bool {
     let Some((after, frames)) = hot_params() else {
         return false;
     };
+    if !hot_now(g) {
+        return false;
+    }
     if let Some(&since) = g.hot.get(&block) {
         if frame.saturating_sub(since) < frames {
             add(T::HotKept, 1);
