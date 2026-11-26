@@ -369,6 +369,33 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
     }
+    // Flamingo: `FLAMINGO_DUMP_RAW_PIPELINES=<folder>` writes the first 16
+    // calls' descriptions (96 words) and every block a word pair of them
+    // names (an address and a size up to 1 MiB) as files, to work out the
+    // layout (`<slot>-<call>-desc.bin`, `<slot>-<call>-w<word>.bin`).
+    #[cfg(windows)]
+    if calls <= 16
+        && let Some(dir) = std::env::var_os("FLAMINGO_DUMP_RAW_PIPELINES")
+    {
+        let dir = std::path::PathBuf::from(dir);
+        let read = |at: usize, len: usize| -> Option<Vec<u8>> {
+            let mut bytes = vec![0u8; len];
+            (at > 0x1_0000 && crate::host::read_into(at as *const u8, &mut bytes)).then_some(bytes)
+        };
+        if let Some(desc) = read(desc as usize, 96 * 8) {
+            let _ = std::fs::write(dir.join(format!("{SLOT:x}-{calls}-desc.bin")), &desc);
+            let words: Vec<u64> = desc.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap_or([0; 8]))).collect();
+            for i in 1..words.len() - 1 {
+                let (at, len) = (words[i] as usize, words[i + 1] as usize);
+                if len > 0
+                    && len <= 1 << 20
+                    && let Some(block) = read(at, len)
+                {
+                    let _ = std::fs::write(dir.join(format!("{SLOT:x}-{calls}-w{i}.bin")), &block);
+                }
+            }
+        }
+    }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
         // pointer is known to be mapped.

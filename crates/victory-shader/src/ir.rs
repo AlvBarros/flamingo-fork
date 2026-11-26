@@ -2211,7 +2211,8 @@ mod tests {
             let guard = st.guards[b][i].expect("a guard");
             st.bools.support(guard).iter().any(|a| matches!(a, crate::structure::Atom::Opaque(_)))
         };
-        assert!(opaque(&alone), "two scalars make an opaque mask");
+        // Two 32-bit restores of the halves are the mask again (#1112).
+        assert!(!opaque(&alone), "the halves restore the compare's mask");
         assert!(!opaque(&shared), "the pair is the compare's mask");
     }
 }

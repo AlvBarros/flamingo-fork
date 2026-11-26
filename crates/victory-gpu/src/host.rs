@@ -1458,6 +1458,11 @@ pub(crate) fn dred_on() -> bool {
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Indirect records that ran empty for want of their list's budget, and the
+/// largest cost of one (told from 2^22 on), likewise (VIctory-7900XTX
+/// 449830f6).
+static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
 /// before). The clamp charges it with atomics, at least two in a row for
@@ -2663,6 +2668,20 @@ struct Sent {
     back: Vec<Declared>,
     /// Its bottom-of-pipe writes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Deferred copies that wait for its copy-back ([`Batch::late`]).
+    late: Vec<LateCopy>,
+}
+
+/// A deferred copy kept past its submission's run (VIctory #2810):
+/// destination, source, bytes, whether the destination is title memory.
+type LateCopy = (usize, usize, usize, bool);
+
+/// Runs a [`LateCopy`], after the copy-back of what the shaders wrote.
+fn late_copy(&(dst, src, len, title): &LateCopy) {
+    copy_mapped(dst as *mut u8, src as *const u8, len, title);
+    if title {
+        crate::watch::wrote(dst, len);
+    }
 }
 
 /// A submission on the card that has not been waited for ([`late`]): its
@@ -2683,6 +2702,8 @@ enum Late {
     Run(Flight),
     /// A bottom-of-pipe write of the flight before it: address, what, bytes.
     Write(usize, crate::queue::Written, usize),
+    /// A deferred copy of the flight before it, after its copy-back.
+    Copy(LateCopy),
     /// A fence (its address) signalled behind the flights before it.
     Signal(usize, u64),
 }
@@ -5246,6 +5267,7 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                Late::Copy(copy) => late_copy(&copy),
                 Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
             }
         }
@@ -5478,6 +5500,7 @@ impl Host {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(written, sent.late.iter().filter(|c| c.3).map(|c| (c.0, c.0 + c.2)));
             *flying += order.len();
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5488,6 +5511,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
             }));
+            items.extend(sent.late.into_iter().map(Late::Copy));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
             *flying >= late_most()
         };
@@ -5522,6 +5546,7 @@ impl Host {
             let mut line = line();
             let Line { line: items, written, lists: flying, target, .. } = &mut *line;
             join_ranges(written, sent.back.iter().flat_map(|(_, ranges)| ranges.iter().copied()));
+            join_ranges(written, sent.late.iter().filter(|c| c.3).map(|c| (c.0, c.0 + c.2)));
             *flying += 1;
             *target = *submitted;
             items.push(Late::Run(Flight {
@@ -5532,6 +5557,7 @@ impl Host {
                 card: sent.card,
                 back: sent.back,
             }));
+            items.extend(sent.late.into_iter().map(Late::Copy));
             items.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
         }
         LATE_STATS[0].fetch_add(1, Ordering::Relaxed);
@@ -5672,6 +5698,7 @@ impl Host {
                         landed.push((flight.lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
+                    Late::Copy(copy) => late_copy(&copy),
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
                 }
             }
@@ -5886,6 +5913,7 @@ impl Host {
                 card,
                 back,
                 writes,
+                late: std::mem::take(&mut batch.late),
             };
             working(was_working);
             return Some((submitted, sent));
@@ -6013,6 +6041,7 @@ impl Host {
             add(C::NothingBackUs, gpu.as_micros() as u64);
         }
         copy_back(0, copying.elapsed().as_micros() as u64);
+        batch.late.iter().for_each(late_copy);
         for list in runs {
             // Read backs first: a value written at the bottom of the pipe
             // may be what tells the title that they are there.
@@ -7179,7 +7208,10 @@ impl HostList {
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                let (refused, biggest) = (words.add(3).read_volatile(), words.add(4).read_volatile());
+                BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
+                BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
+                for k in 0..5 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -7213,7 +7245,7 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        let zeros = [0u64, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: at + offset,
             Value: 0,
         });
@@ -7254,7 +7286,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 8);
+            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -7394,6 +7426,14 @@ impl HostList {
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
+                    // VIctory #2810: in recorded order. A source the
+                    // submission's shaders write is still old here (it
+                    // lands in the copy-back), a destination they write
+                    // would lose their bytes: either way, after the copy-back.
+                    if batch.gpu_written(src, len) || batch.gpu_written(dst, len) {
+                        batch.keep_late((dst, src, len, true));
+                        continue;
+                    }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7405,6 +7445,10 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
+                    }
+                    if batch.gpu_written(src, len) {
+                        batch.keep_late((dst, src, len, false));
+                        continue;
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
@@ -7442,6 +7486,7 @@ impl HostList {
                     // range a dispatch writes made thousands of write-watch
                     // askings a frame).
                     batch.flush_one(shadow);
+                    batch.gpu_writes.push((*address, *address + *len));
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
                     shadow.writing(*address, *len);
@@ -7565,9 +7610,30 @@ struct Batch {
     /// flush (before a step that writes title memory, and before the lists
     /// run), several at a time.
     textures_due: Vec<std::sync::Arc<crate::texture::Staging>>,
+    /// Title ranges (start, end) the submission's shaders are declared to
+    /// write so far: what they write reaches title memory in the copy-back.
+    gpu_writes: Vec<(usize, usize)>,
+    /// Deferred copies touching them, in recorded order, run after the
+    /// copy-back (VIctory #2810).
+    late: Vec<LateCopy>,
 }
 
 impl Batch {
+    /// Whether `len` title bytes at `at` touch a range the submission's
+    /// shaders write.
+    fn gpu_written(&self, at: usize, len: usize) -> bool {
+        self.gpu_writes.iter().any(|&(a, b)| a < at + len && at < b)
+    }
+
+    fn keep_late(&mut self, copy: LateCopy) {
+        static KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = KEPT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(n, bytes = copy.2, "deferred copies of bytes the same submission's shaders write, run after its copy-back");
+        }
+        self.late.push(copy);
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -8432,8 +8498,10 @@ impl Meter {
         let indirect = crate::list::take_indirect() as f64 / frames;
         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
+        let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+        let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
         tracing::info!(
-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; {refused:.2} indirect records a frame ran empty for want of their list's budget (the largest cost {biggest}; VICTORY_INDIRECT_REST=0: one that does not fit takes nothing)"
         );
         // (Run 200 counted indirect compute records asking for 77,000 to
         // 98,000 groups in x, 0.2 to 0.8 a frame, cut to the 65,535 one

@@ -90,6 +90,81 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// Flamingo: on a capped host, the title slots past `count` that shaders asked for, in
+    /// host slots of their own ([`Spill`]).
+    spill: Option<Spill>,
+}
+
+/// Flamingo: title view slots past the ones a capped host heap mirrors in place, given host
+/// slots when shaders ask for them (`victory_shader::emit::SLOT_VIEW_REMAP`). The title's
+/// heap has 1,245,184 slots and fills them nearly all; NVIDIA's heap holds 1,000,000 views,
+/// of which 737,855 mirror the title's in place beside the dynamic slots. The host slots are
+/// a block at the end of the dynamic slots, taken from them once.
+pub(crate) struct Spill {
+    /// The first title slot spilled (`count`) and the title heap's own count.
+    first: u32,
+    titles: u32,
+    /// The table shaders read: one dword per title slot from `first` to
+    /// `VIEW_REMAP_END`, the host slot or `u32::MAX` (mapped, written here).
+    table: (ID3D12Resource, usize, u64),
+    /// The title slots shaders found without one (`VIEW_FAULTS` dwords, 0 a sink).
+    faults: (ID3D12Resource, usize, u64),
+    state: Mutex<SpillState>,
+}
+
+#[derive(Default)]
+struct SpillState {
+    /// Title slot to host slot.
+    slots: std::collections::HashMap<u32, u32>,
+    /// Title slots in the order they got their host slot (the first goes first).
+    order: std::collections::VecDeque<u32>,
+    /// Host slots free to give.
+    free: Vec<u32>,
+    /// Host slots given back, with the frame: a submission in the air may still read them.
+    resting: std::collections::VecDeque<(u64, u32)>,
+    /// Counts for the log: slots given, slots taken back, notes read.
+    given: u64,
+    taken_back: u64,
+    noted: u64,
+}
+
+// SAFETY: the mappings are of buffers the spill holds, written under its lock or read
+// with volatile reads.
+unsafe impl Send for Spill {}
+// SAFETY: as above.
+unsafe impl Sync for Spill {}
+
+/// An empty spill table and a sink for its notes, for a shader that reads them through a
+/// heap with no spill of its own (its GPU addresses; zeros if they could not be made).
+pub(crate) fn spill_fallback() -> (u64, u64) {
+    static MADE: std::sync::OnceLock<Option<(ID3D12Resource, ID3D12Resource)>> = std::sync::OnceLock::new();
+    let made = MADE.get_or_init(|| {
+        use victory_shader::emit::{VIEW_FAULTS, VIEW_REMAP_END};
+        let host = host()?;
+        let (table, data) = host.shared_buffer(u64::from(VIEW_REMAP_END) * 4)?;
+        let (faults, sink) = host.shared_buffer(u64::from(VIEW_FAULTS) * 4)?;
+        // SAFETY: fresh mappings of those sizes.
+        unsafe {
+            std::ptr::write_bytes(data, 0xFF, VIEW_REMAP_END as usize * 4);
+            std::ptr::write_bytes(sink, 0, VIEW_FAULTS as usize * 4);
+        }
+        Some((table, faults))
+    });
+    // SAFETY: live buffers.
+    made.as_ref().map_or((0, 0), |(t, f)| unsafe { (t.GetGPUVirtualAddress(), f.GetGPUVirtualAddress()) })
+}
+
+/// Host slots for spilled title slots (`FLAMINGO_SPILL_SLOTS`, off by default, at most a quarter of the
+/// dynamic slots; 0 turns the spill off).
+fn spill_slots() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("FLAMINGO_SPILL_SLOTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+            .min(DYNAMIC / 4)
+    })
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -872,7 +947,7 @@ pub(crate) fn probe_view_limit() {
 /// still holds its own; a draw refused its table read slots never made
 /// for it, and the card stopped within frames). 2^18 leaves 737,000; a
 /// table past them is made afresh in these slots like any other.
-pub(crate) const DYNAMIC: u32 = 1 << 18;
+pub(crate) const DYNAMIC: u32 = victory_shader::emit::VIEW_DYNAMIC;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -901,6 +976,7 @@ impl HostHeap {
         if !sampler {
             probe_view_limit();
         }
+        let titles = count;
         let null = if sampler {
             0
         } else {
@@ -961,6 +1037,53 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let reserved = if !sampler
+            && titles > count
+            && victory_shader::emit::view_spill_first() == count
+            && spill_slots() > 0
+        {
+            spill_slots()
+        } else {
+            0
+        };
+        let spill = (reserved > 0)
+            .then(|| {
+                use victory_shader::emit::{VIEW_FAULTS, VIEW_REMAP_END};
+                let make = |dwords: u32, fill: u8, what: &str| {
+                    let (buffer, data) = host.shared_buffer(u64::from(dwords) * 4)?;
+                    crate::host::name(&buffer, || format!("spilled view slots: {what}"));
+                    // SAFETY: a fresh mapping of that many bytes; a live buffer.
+                    let gpu = unsafe {
+                        std::ptr::write_bytes(data, fill, dwords as usize * 4);
+                        buffer.GetGPUVirtualAddress()
+                    };
+                    Some((buffer, data as usize, gpu))
+                };
+                let table = make(VIEW_REMAP_END - count, 0xFF, "table")?;
+                let faults = make(VIEW_FAULTS, 0, "faults")?;
+                // The block's last slot (the one below the null slot) views the notes.
+                let first_slot = count + DYNAMIC - reserved;
+                tracing::info!(
+                    titles,
+                    mirrored = count,
+                    host_slots = reserved,
+                    "title view slots past the host heap's get host slots when shaders ask for them (FLAMINGO_SPILL_SLOTS)"
+                );
+                Some(Spill {
+                    first: count,
+                    titles,
+                    table,
+                    faults,
+                    state: Mutex::new(SpillState {
+                        free: (first_slot..first_slot + reserved - 1).rev().collect(),
+                        ..Default::default()
+                    }),
+                })
+            })
+            .flatten();
+        let reserved = if spill.is_some() { reserved } else { 0 };
+        let mut taken = vec![false; DYNAMIC as usize];
+        taken[(DYNAMIC - reserved) as usize..].fill(true);
         let h = HostHeap {
             heap,
             cpu,
@@ -971,8 +1094,8 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, taken)),
+            free: std::sync::atomic::AtomicU32::new(DYNAMIC - reserved),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -991,6 +1114,7 @@ impl HostHeap {
                 }
                 spans
             },
+            spill,
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1001,6 +1125,11 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
         }
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
+        // The view the spill's notes are written through (shaders write past its end when
+        // they have nothing to note: the view bounds them).
+        if let Some(spill) = &h.spill {
+            h.raw_uav_at(h.count + DYNAMIC - 1, &spill.faults.0, 0, u64::from(victory_shader::emit::VIEW_FAULTS) * 4);
+        }
         Some(h)
     }
 
@@ -1124,6 +1253,104 @@ impl HostHeap {
     /// when the host caps its size.
     pub(crate) fn count(&self) -> u32 {
         self.count
+    }
+
+    /// The GPU addresses of the spill's table and fault notes ([`Spill`]).
+    pub(crate) fn spill_gpu(&self) -> Option<(u64, u64)> {
+        self.spill.as_ref().map(|s| (s.table.2, s.faults.2))
+    }
+
+    /// A title write of spilled slot `index` (its record at `handle`): its host slot, if it
+    /// has one, is made again. Whether the slot is spilled at all.
+    pub(crate) fn spill_rewrite(&self, index: u32, handle: u64) -> bool {
+        let Some(spill) = &self.spill else { return false };
+        if index < spill.first || index >= spill.titles {
+            return false;
+        }
+        let slot = spill.state.lock().unwrap_or_else(|e| e.into_inner()).slots.get(&index).copied();
+        if let Some(slot) = slot {
+            match super::view(handle) {
+                Some(view) => self.make_at(slot, &view),
+                None => self.make_null(slot),
+            }
+        }
+        true
+    }
+
+    /// What shaders noted since the last time (title slots past the ones in place that they
+    /// found without a host slot) gets host slots, the oldest given back when none is free;
+    /// the heap's descriptors begin at title address `start`. Once a submission, before its
+    /// lists go to the card; `frame`: the frame being made.
+    pub(crate) fn spill_take(&self, start: u64, frame: u64) {
+        use victory_shader::emit::VIEW_FAULTS;
+        let Some(spill) = &self.spill else { return };
+        let mut noted = Vec::new();
+        for i in 1..VIEW_FAULTS as usize {
+            // SAFETY: inside the notes' mapping; the card may be writing: a note missed now
+            // is written again.
+            let at = unsafe { (spill.faults.1 as *mut u32).add(i) };
+            // SAFETY: as above.
+            let index = unsafe { at.read_volatile() };
+            if index != 0 {
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+                if index >= spill.first && index < spill.titles {
+                    noted.push(index);
+                }
+            }
+        }
+        let mut state = spill.state.lock().unwrap_or_else(|e| e.into_inner());
+        // Slots given back three frames ago or more are free again.
+        while state.resting.front().is_some_and(|&(f, _)| f + 3 <= frame) {
+            let (_, slot) = state.resting.pop_front().expect("checked");
+            state.free.push(slot);
+        }
+        if noted.is_empty() {
+            return;
+        }
+        noted.sort_unstable();
+        noted.dedup();
+        state.noted += noted.len() as u64;
+        let table = spill.table.1 as *mut u32;
+        for index in noted {
+            if state.slots.contains_key(&index) {
+                continue;
+            }
+            if state.free.is_empty() {
+                // The oldest goes: its entry first, so that shaders stop reading its slot.
+                let Some(old) = state.order.pop_front() else { break };
+                if let Some(slot) = state.slots.remove(&old) {
+                    // SAFETY: inside the table's mapping (`old` is past `first`).
+                    unsafe { table.add((old - spill.first) as usize).write_volatile(u32::MAX) };
+                    state.resting.push_back((frame, slot));
+                    state.taken_back += 1;
+                }
+                continue;
+            }
+            let slot = state.free.pop().expect("checked");
+            match super::view(start + u64::from(index) * 32) {
+                Some(view) => self.make_at(slot, &view),
+                None => self.make_null(slot),
+            }
+            // SAFETY: inside the table's mapping; the slot was made first.
+            unsafe { table.add((index - spill.first) as usize).write_volatile(slot) };
+            state.slots.insert(index, slot);
+            state.order.push_back(index);
+            state.given += 1;
+        }
+        // The log: every so often what the spill did.
+        static TOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let told = TOLD.load(std::sync::atomic::Ordering::Relaxed);
+        if state.given >= told * 2 + 256 {
+            TOLD.store(state.given, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!(
+                given = state.given,
+                taken_back = state.taken_back,
+                noted = state.noted,
+                held = state.slots.len(),
+                "spilled view slots: host slots given to title slots shaders asked for"
+            );
+        }
     }
 
     /// The GPU address of the table of element strides by title slot (view
@@ -1988,6 +2215,9 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        if index >= self.count && self.spill_rewrite(index, handle) {
+            return None;
+        }
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.

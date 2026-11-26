@@ -1153,6 +1153,16 @@ impl State {
         crate::memory::ready(list, heap, &addresses, &constants, writes)
     }
 
+    /// The GPU addresses of the bound view heap's spill table and fault notes, or of an
+    /// empty table and a sink where it has none (`crate::descriptor::host::Spill`).
+    fn view_spill(&self) -> (u64, u64) {
+        let own = match self.heaps[0] {
+            0 => None,
+            h => crate::descriptor::heap(h as This).host().and_then(|host| host.spill_gpu()),
+        };
+        own.unwrap_or_else(crate::descriptor::host::spill_fallback)
+    }
+
     /// The bound heap holding `handle`.
     fn heap_of(&self, handle: u64) -> Option<&'static crate::descriptor::Heap> {
         self.heaps
@@ -1386,6 +1396,20 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
+                    if srv && slot == victory_shader::emit::SLOT_VIEW_REMAP {
+                        // Ours: the table of spilled view slots (`HostHeap::spill_gpu`).
+                        let (table, _) = self.view_spill();
+                        // SAFETY: an open list; the table lives as long as its heap, which
+                        // the list holds, or the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, table);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, table);
+                            }
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {
@@ -1464,6 +1488,19 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_VIEW_FAULTS {
+                    // Ours: where shaders note the spilled view slots they found without one.
+                    let (_, faults) = self.view_spill();
+                    // SAFETY: as for the table above.
+                    unsafe {
+                        if compute {
+                            l.SetComputeRootUnorderedAccessView(param, faults);
+                        } else {
+                            l.SetGraphicsRootUnorderedAccessView(param, faults);
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -3035,7 +3072,9 @@ impl State {
                 (table, n, h.finish())
             });
             if let Some(&first) = key.as_ref().and_then(|key| self.fresh_tables.get(key)) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                // VIctory #2850: constant views too (their bytes may have
+                // changed since the table was made, by a copy).
+                for u in &entries {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
@@ -3052,7 +3091,8 @@ impl State {
                         readable(list, kind, &view);
                     }
                 }
-                made.push((slot, first * 32));
+                let flag = if victory_shader::emit::view_host_flag() { victory_shader::emit::HOST_INDEX_BYTES } else { 0 };
+                made.push((slot, (first * 32) | flag));
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -3160,7 +3200,10 @@ impl State {
                     }
                 }
             }
-            made.push((slot, first * 32));
+            // Flamingo: marked as the host's own, so that the shader does not take it for a
+            // title index past the slots mirrored in place (`HOST_INDEX_BYTES`).
+            let flag = if victory_shader::emit::view_host_flag() { victory_shader::emit::HOST_INDEX_BYTES } else { 0 };
+            made.push((slot, (first * 32) | flag));
         }
         made
     }

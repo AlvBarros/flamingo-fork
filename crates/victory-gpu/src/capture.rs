@@ -413,9 +413,22 @@ pub(crate) fn dump_args(frame: u64) {
         } else {
             "unreadable".into()
         };
-        out += &format!("kind {kind} at {at:#x}: {words}\n");
+        // The host copy's side: what the card used (copies in the PC's
+        // memory only; `VICTORY_CARD_BUFFERS_MIN_MB` large keeps them there).
+        let copy = crate::shadow::find(at, 16)
+            .and_then(|s| s.peek(at, 16))
+            .map(|b| format!("{:?}", b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect::<Vec<u32>>()))
+            .unwrap_or_else(|| "-".into());
+        out += &format!("kind {kind} at {at:#x}: {words} copy {copy}\n");
     }
     let _ = std::fs::write(folder.join(format!("frame-{frame}-args.txt")), out);
+}
+
+/// The view heaps' occupancy at listed frame `frame`'s present
+/// (`crate::descriptor::occupancy`), as `frame-<n>-heaps.txt`.
+pub(crate) fn dump_heaps(frame: u64) {
+    let Some(folder) = folder() else { return };
+    let _ = std::fs::write(folder.join(format!("frame-{frame}-heaps.txt")), crate::descriptor::occupancy());
 }
 
 pub(crate) fn dump_targets(frame: u64) {

@@ -865,7 +865,7 @@ impl Module {
                 let inst = &self.insts[i as usize];
                 let rel = |v: V| {
                     let a = abs(v);
-                    assert!(a < inst_id, "forward reference outside a phi");
+                    assert!(a < inst_id, "forward reference outside a phi: {:?} uses {v:?}", inst.op);
                     u64::from(inst_id - a)
                 };
                 match &inst.op {

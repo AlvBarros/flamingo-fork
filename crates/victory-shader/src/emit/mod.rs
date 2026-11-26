@@ -126,7 +126,8 @@ pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_ADDRESSES, SLOT_FAULTS, SLOT_MEMORY,
     SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_STRIDES_DWORDS, USER_DATA_SPACE, USER_DISPATCH_THREADS, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    set_view_heap_limit, view_heap_limit, HOST_INDEX_BYTES, VIEW_DYNAMIC, view_host_flag,
+    SLOT_VIEW_FAULTS, SLOT_VIEW_REMAP, VIEW_FAULTS, VIEW_REMAP_END, view_spill_first,
 };
 
 /// The loop limit without an override: 2^20.

@@ -2453,6 +2453,22 @@ impl Shadow {
     }
 
     /// The offset of a title address in the copy, if it lies in it.
+    /// Diagnostics: `len` bytes of the copy at title address `at` as its
+    /// mapping holds them now (what shaders wrote there, once they ran), if
+    /// the copy lives where the CPU reads it (not in the card's memory).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn peek(&self, at: u64, len: usize) -> Option<Vec<u8>> {
+        if self.card.is_some() || self.data.is_null() {
+            return None;
+        }
+        let off = self.offset_in(at)? as usize;
+        if off + len > self.len as usize {
+            return None;
+        }
+        // SAFETY: inside the copy's mapping (checked above).
+        Some(unsafe { std::slice::from_raw_parts(self.data.add(self.offset(at) as usize), len) }.to_vec())
+    }
+
     pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
         address.checked_sub(self.start).filter(|&at| at < self.len)
     }

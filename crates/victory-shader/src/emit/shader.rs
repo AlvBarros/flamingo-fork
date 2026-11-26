@@ -2,7 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
-use super::bitcode::{Attr, Md, Module, Ty, V};
+use super::bitcode::{Attr, Bin, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
 /// Where the shader reads its user data: `b0` in this space.
@@ -57,6 +57,20 @@ pub const SLOT_STRIDES_DWORDS: u32 = 3 * SLOT_STRIDES_COUNT;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// Flamingo: on a capped host, title view slots past the ones mirrored in place
+/// ([`view_host_flag`]) get one of the host's slots when a shader asks for them. The root SRV
+/// `t<SLOT_VIEW_REMAP>` in [`ROOT_CBV_SPACE`] holds one dword per title slot from the first
+/// spilled one up to [`VIEW_REMAP_END`]: the host slot, or `u32::MAX` while it has none. A
+/// shader that finds none reads the null slot and writes the title slot into the root UAV
+/// `u<SLOT_VIEW_FAULTS>` ([`VIEW_FAULTS`] dwords, dword 0 a sink); the host gives those slots
+/// a host slot for the frames to come.
+pub const SLOT_VIEW_REMAP: u8 = 252;
+/// See [`SLOT_VIEW_REMAP`].
+pub const SLOT_VIEW_FAULTS: u8 = 251;
+/// Dwords of the [`SLOT_VIEW_FAULTS`] buffer.
+pub const VIEW_FAULTS: u32 = 4096;
+/// The title slot the [`SLOT_VIEW_REMAP`] table ends at (title heaps are below 2^21 views).
+pub const VIEW_REMAP_END: u32 = 1 << 21;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.
@@ -157,6 +171,60 @@ pub fn set_view_heap_limit(null_slot: u32) {
 /// See [`VIEW_LIMIT`]: the null slot shaders translated now clamp view indices to (0: none).
 pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Flamingo: the host's dynamic view slots (`victory-gpu`'s `DYNAMIC`), which sit between the
+/// title's slots mirrored in place and the null slot on a capped host.
+pub const VIEW_DYNAMIC: u32 = 1 << 18;
+
+/// Flamingo: added to a table's byte offset the host made itself (a table made afresh in its
+/// dynamic slots): the heap index the shader computes from it is then `HOST_INDEX` past the
+/// host slot, which no title index reaches (the largest title heaps are about 2^21 views).
+pub const HOST_INDEX_BYTES: u32 = 1 << 31;
+const HOST_INDEX: u32 = HOST_INDEX_BYTES >> 5;
+
+/// Flamingo: on a host whose view heap is capped below what an uncapped one holds (2^21
+/// views), the title's view slots mirrored in place (0: no such limit). A title index at or
+/// past it read one of the host's dynamic slots behind them: a descriptor of some draw's
+/// table made afresh, so wrong textures, flicker, and buffers read as vertices that were not
+/// (spikes and cages around characters). The heap is 1,245,184 views and fills to its end;
+/// NVIDIA's limit leaves 737,855 of them in place.
+/// `FLAMINGO_TITLE_NULL=0` leaves such indices as they were (into the dynamic slots).
+fn view_title_limit() -> u32 {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var_os("FLAMINGO_TITLE_NULL").is_some_and(|v| v == "0")) {
+        return 0;
+    }
+    let limit = view_limit();
+    if limit != 0 && limit < (1 << 21) - 1 {
+        limit.saturating_sub(VIEW_DYNAMIC)
+    } else {
+        0
+    }
+}
+
+/// Whether table offsets the host makes carry [`HOST_INDEX_BYTES`] (see [`view_title_limit`]).
+pub fn view_host_flag() -> bool {
+    view_title_limit() != 0
+}
+
+/// The host heap slot of the view of the spill's notes: the one below the null slot.
+pub fn view_faults_slot() -> u32 {
+    view_limit().saturating_sub(1)
+}
+
+/// The first title slot of the [`SLOT_VIEW_REMAP`] table (0: no table; `FLAMINGO_SPILL_SLOTS=0`
+/// leaves it out, and those title slots read the null slot).
+pub fn view_spill_first() -> u32 {
+    // Off unless asked for (`FLAMINGO_SPILL_SLOTS=<n>`, n > 0): run 153 drew the world
+    // untextured with it, and no note reached the host.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| {
+        std::env::var("FLAMINGO_SPILL_SLOTS").ok().and_then(|v| v.parse::<u32>().ok()).is_some_and(|n| n > 0)
+    }) {
+        return 0;
+    }
+    view_title_limit()
 }
 
 pub(crate) struct Shader {
@@ -434,6 +502,91 @@ impl Shader {
     /// A descriptor heap handle, annotated with `props`; `nonuniform` when
     /// the index may differ between lanes (`NonUniformResourceIndex`).
     pub fn heap_handle(
+        &mut self,
+        block: usize,
+        index: V,
+        sampler: bool,
+        nonuniform: bool,
+        props: (u32, u32),
+    ) -> V {
+        let title = view_title_limit();
+        if sampler || title == 0 {
+            return self.host_heap_handle(block, index, sampler, nonuniform, props);
+        }
+        // A title index: at or past the slots mirrored in place, the host slot the spill
+        // table gives it ([`SLOT_VIEW_REMAP`]), or the null slot (noted as a fault); an index
+        // the host made (`HOST_INDEX` past its slot), that slot. In integer arithmetic (no
+        // compare and select, which made the bitcode invalid here): `host` is 1 for the
+        // host's own, `over` 1 for a title index at or past `title`.
+        let i32t = self.t.i32;
+        let k = |s: &mut Self, v: u32| s.m.i32(v);
+        let (k26, one, last_title, null) = (k(self, 26), k(self, 1), k(self, title - 1), k(self, view_limit()));
+        let high = self.m.bin(block, Bin::LShr, index, k26);
+        let host = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[high, one]);
+        let at_least = self.op(block, "binary.i32", Attr::ReadNone, i32t, 39, &[index, last_title]);
+        let past = self.m.bin(block, Bin::Sub, at_least, last_title);
+        let over = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[past, one]);
+        let titled = if view_spill_first() == 0 {
+            // No spill table: those title slots read the null slot.
+            let to_null = self.m.bin(block, Bin::Sub, null, index);
+            let shift = self.m.bin(block, Bin::Mul, over, to_null);
+            self.m.bin(block, Bin::Add, index, shift)
+        } else {
+        // The spill table's entry (one read for an index below `title` too, ignored).
+        let first = k(self, title);
+        let rel = self.m.bin(block, Bin::Sub, index, first);
+        let last_entry = k(self, VIEW_REMAP_END - title - 1);
+        let entry = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[rel, last_entry]);
+        let two = k(self, 2);
+        let byte = self.m.bin(block, Bin::Shl, entry, two);
+        let table = self.root_srv_handle(SLOT_VIEW_REMAP);
+        let iu = self.m.undef(i32t);
+        let (mask, align) = (self.m.i8(1), k(self, 4));
+        let res = self.t.res_ret;
+        let loaded = self.op(block, "rawBufferLoad.f32", Attr::ReadOnly, res, 139, &[table, byte, iu, mask, align]);
+        let f = self.m.extract(block, loaded, 0);
+        let spilled = self.m.cast(block, super::bitcode::Cast::Bitcast, f, i32t);
+        let slot = self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[spilled, null]);
+        let to_slot = self.m.bin(block, Bin::Sub, slot, index);
+        let shift = self.m.bin(block, Bin::Mul, over, to_slot);
+        let titled = self.m.bin(block, Bin::Add, index, shift);
+        // None there yet: the title slot is noted (at the sink, dword 0, otherwise).
+        let k31 = k(self, 31);
+        let absent = self.m.bin(block, Bin::LShr, spilled, k31);
+        let not_host = self.m.bin(block, Bin::Sub, one, host);
+        let noted = self.m.bin(block, Bin::Mul, over, absent);
+        let noted = self.m.bin(block, Bin::Mul, noted, not_host);
+        let places = k(self, VIEW_FAULTS - 1);
+        let place = self.m.bin(block, Bin::URem, rel, places);
+        let place = self.m.bin(block, Bin::Add, place, one);
+        let place = self.m.bin(block, Bin::Shl, place, two);
+        // The notes are a view of their buffer at the host slot below the null one
+        // ([`view_faults_slot`]); a lane with nothing to note writes 1 GiB past the view's
+        // end, which the card drops (no branch, no traffic). Vertex and geometry stages
+        // write views only with a flag the host need not take: they note nothing.
+        if self.pixel || self.mesh.is_some() || self.threads.is_some() {
+            let away = k(self, 1 << 30);
+            let quiet = self.m.bin(block, Bin::Sub, one, noted);
+            let off = self.m.bin(block, Bin::Mul, quiet, away);
+            let at = self.m.bin(block, Bin::Add, place, off);
+            let slot = k(self, view_faults_slot());
+            let faults = self.host_heap_handle(block, slot, false, false, (11 | 0x1000, 0));
+            let void = self.t.void;
+            self.op(block, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &[faults, at, iu, index, iu, iu, iu, mask, align]);
+        }
+        titled
+        };
+        let flag = k(self, HOST_INDEX);
+        let own = self.m.bin(block, Bin::Sub, index, flag);
+        let to_own = self.m.bin(block, Bin::Sub, own, titled);
+        let shift = self.m.bin(block, Bin::Mul, host, to_own);
+        let index = self.m.bin(block, Bin::Add, titled, shift);
+        self.host_heap_handle(block, index, false, nonuniform, props)
+    }
+
+    /// A handle for heap slot `index` as the host numbers its slots (memory copies' views,
+    /// dynamic slots): clamped to the null slot, as every index once was.
+    pub fn host_heap_handle(
         &mut self,
         block: usize,
         index: V,
@@ -945,5 +1098,58 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod title_index_tests {
+    use super::HOST_INDEX;
+
+    /// What [`super::Shader::heap_handle`] emits for a view index on a capped host, in the
+    /// same wrapping integer steps: `title` slots mirrored in place, `null` the null slot.
+    fn slot(index: u32, title: u32, null: u32) -> u32 {
+        let host = (index >> 26).min(1);
+        let over = (index.max(title - 1) - (title - 1)).min(1);
+        let titled = index.wrapping_add(over.wrapping_mul(null.wrapping_sub(index)));
+        let own = index.wrapping_sub(HOST_INDEX);
+        titled.wrapping_add(host.wrapping_mul(own.wrapping_sub(titled))).min(null)
+    }
+
+    #[test]
+    fn title_indices_past_the_mirrored_slots_read_null_and_the_hosts_own_stay() {
+        let (title, null) = (737_855, 999_999);
+        assert_eq!(slot(0, title, null), 0);
+        assert_eq!(slot(title - 1, title, null), title - 1, "the last slot mirrored in place");
+        assert_eq!(slot(title, title, null), null, "the first dynamic slot is not the title's");
+        assert_eq!(slot(1_245_183, title, null), null, "the title heap's last slot");
+        assert_eq!(slot(HOST_INDEX + title + 5, title, null), title + 5, "a table the host made");
+        assert_eq!(slot(HOST_INDEX + null, title, null), null);
+    }
+
+    /// The spill table's part of [`super::Shader::heap_handle`]: `spilled` the table's entry
+    /// for the index. The host slot (or null), and the fault buffer's byte the index goes to.
+    fn spill(index: u32, title: u32, null: u32, spilled: u32) -> (u32, u32) {
+        use super::{VIEW_FAULTS, VIEW_REMAP_END};
+        let host = (index >> 26).min(1);
+        let over = (index.max(title - 1) - (title - 1)).min(1);
+        let rel = index.wrapping_sub(title);
+        let _entry = rel.min(VIEW_REMAP_END - title - 1);
+        let slot = spilled.min(null);
+        let titled = index.wrapping_add(over.wrapping_mul(slot.wrapping_sub(index)));
+        let noted = over * (spilled >> 31) * (1 - host);
+        let place = ((rel % (VIEW_FAULTS - 1)) + 1).wrapping_shl(2).wrapping_mul(noted);
+        let own = index.wrapping_sub(HOST_INDEX);
+        (titled.wrapping_add(host.wrapping_mul(own.wrapping_sub(titled))).min(null), place)
+    }
+
+    #[test]
+    fn spilled_title_slots_read_their_host_slot_or_note_a_fault() {
+        let (title, null) = (737_855, 999_999);
+        assert_eq!(spill(900_000, title, null, 990_000), (990_000, 0), "a host slot: no note");
+        let (slot, place) = spill(900_000, title, null, u32::MAX);
+        assert_eq!(slot, null, "none yet: the null slot");
+        assert!(place != 0 && place < 4 * super::VIEW_FAULTS, "and a note");
+        assert_eq!(spill(5, title, null, u32::MAX), (5, 0), "in place: no note whatever the entry");
+        assert_eq!(spill(HOST_INDEX + title + 9, title, null, u32::MAX), (title + 9, 0), "the host's own: no note");
     }
 }
