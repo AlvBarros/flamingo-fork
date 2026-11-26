@@ -519,6 +519,36 @@ fn dump_ranges_asked() -> Vec<(u64, u64)> {
         .collect()
 }
 
+/// The view heap slots the ops dump describes at the pipeline [`dump_at`] names
+/// (`FLAMINGO_DUMP_SLOTS=<index,...>`): buffers a program picks from the heap by an index in
+/// its constants, as the title wrote them and as the host made them.
+pub(crate) fn dump_slots() -> &'static [u32] {
+    static SLOTS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        std::env::var("FLAMINGO_DUMP_SLOTS")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    })
+}
+
+/// `FLAMINGO_DUMP_SLOT_WORD=<table dword>:<word>,...`: constant buffers at those table offsets
+/// whose words name view heap slots to describe as [`dump_slots`] do.
+pub(crate) fn dump_slot_words() -> &'static [(u32, u32)] {
+    static AT: std::sync::OnceLock<Vec<(u32, u32)>> = std::sync::OnceLock::new();
+    AT.get_or_init(|| {
+        std::env::var("FLAMINGO_DUMP_SLOT_WORD")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|w| {
+                let (at, word) = w.split_once(':')?;
+                Some((at.trim().parse().ok()?, word.trim().parse().ok()?))
+            })
+            .collect()
+    })
+}
+
 /// The indirect command [`note_ranges`] runs after: the first of a listed frame whose pipeline's
 /// name holds `FLAMINGO_DUMP_AT` (the character draws, `PedTransformPreSkinD`, without it).
 pub(crate) fn dump_at() -> &'static str {
@@ -528,7 +558,7 @@ pub(crate) fn dump_at() -> &'static str {
 
 /// At a character mesh draw: the ranges [`dump_ranges_asked`] names copied from their host
 /// copies into read-back buffers, once a listed frame.
-pub(crate) fn note_ranges(list: &crate::host::HostList) {
+pub(crate) fn note_ranges(list: &crate::host::HostList, extra: &[(u64, u64)]) {
     let frame = crate::queue::presented() + 1;
     if folder().is_none() || !listed(frame) {
         return;
@@ -539,7 +569,7 @@ pub(crate) fn note_ranges(list: &crate::host::HostList) {
     }
     let asked = dump_ranges_asked();
     let Some(host) = crate::host::host() else { return };
-    for &(address, len) in &asked {
+    for &(address, len) in asked.iter().chain(extra) {
         let Some(shadow) = crate::shadow::find(address, len) else {
             tracing::info!(address = format_args!("{address:#x}"), len, "range to dump has no host copy");
             continue;

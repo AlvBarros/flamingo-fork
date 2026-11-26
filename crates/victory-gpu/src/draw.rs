@@ -1817,7 +1817,7 @@ impl State {
             // Read before the slot is made: a write after it is seen next pass.
             let record = crate::descriptor::record_at(handle);
             let entry = crate::descriptor::record_entry(record);
-            let Some(view) = host.mirror(index, handle, true) else {
+            let Some(view) = host.mirror_unmarked(index, handle) else {
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -2584,6 +2584,12 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        // Flamingo diagnostics: `FLAMINGO_DUMP_AT` names direct dispatches too (with the
+        // buffers of the heap slots named there).
+        #[cfg(feature = "diagnostics")]
+        if p.name.contains(crate::capture::dump_at()) {
+            crate::capture::note_ranges(list, &self.named_slot_ranges(p, true));
+        }
         if self.ambient(list, p) {
             // The pass set its own heap, root signature and pipeline: the
             // next draw or dispatch sets the title's again.
@@ -3326,7 +3332,63 @@ impl State {
                 ));
             }
         }
+        if self.heaps[0] != 0 && p.name.contains(crate::capture::dump_at()) {
+            let heap = crate::descriptor::heap(self.heaps[0] as This);
+            for index in self.named_slots(p, compute) {
+                let title = heap.handle(index).and_then(crate::descriptor::view);
+                let title: String = format!("{title:?}").chars().take(240).collect();
+                let host = heap.host().and_then(|h| h.describe_slot(index));
+                out.push(format!("slot {index}: title {title} host {host:?}"));
+            }
+        }
         out
+    }
+
+    /// The view heap slots the ops dump describes, and the range dump takes, at the pipeline
+    /// `FLAMINGO_DUMP_AT` names: those `FLAMINGO_DUMP_SLOTS` lists, and the one a word of a
+    /// constant buffer names (`FLAMINGO_DUMP_SLOT_WORD=<table dword>:<word>`; the skinning's
+    /// geometry: 64:16) (diagnostics builds).
+    #[cfg(feature = "diagnostics")]
+    fn named_slots(&self, p: &HostPipeline, compute: bool) -> Vec<u32> {
+        let mut slots = crate::capture::dump_slots().to_vec();
+        for &(at, word) in crate::capture::dump_slot_words() {
+            for stage in &p.stages {
+                for u in stage.translated().used.iter() {
+                    if u.root != RootType::Table || u.table_offset_dwords != at {
+                        continue;
+                    }
+                    let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                    else {
+                        continue;
+                    };
+                    let at = table + u64::from(at) * 4;
+                    if let Some(View::Constant(address, size)) = crate::descriptor::view(at)
+                        && 4 * (word + 1) <= size
+                        && crate::texture::committed((address + 4 * u64::from(word)) as *const u8, 4)
+                    {
+                        // SAFETY: 4 committed bytes of title memory.
+                        let w = unsafe { ((address + 4 * u64::from(word)) as *const u32).read_unaligned() };
+                        slots.push(w);
+                    }
+                }
+            }
+        }
+        slots
+    }
+
+    /// The title ranges of the buffer views at [`Self::named_slots`], for the range dump
+    /// (diagnostics builds).
+    #[cfg(feature = "diagnostics")]
+    fn named_slot_ranges(&self, p: &HostPipeline, compute: bool) -> Vec<(u64, u64)> {
+        if self.heaps[0] == 0 {
+            return Vec::new();
+        }
+        let heap = crate::descriptor::heap(self.heaps[0] as This);
+        self.named_slots(p, compute)
+            .into_iter()
+            .filter_map(|index| heap.handle(index).and_then(crate::descriptor::view))
+            .filter_map(|v| crate::descriptor::host::buffer_range(&v))
+            .collect()
     }
 
     pub(crate) fn draw(
@@ -3832,7 +3894,7 @@ impl State {
         // `FLAMINGO_DUMP_AT` left them.
         #[cfg(feature = "diagnostics")]
         if p.name.contains(crate::capture::dump_at()) {
-            crate::capture::note_ranges(list);
+            crate::capture::note_ranges(list, &[]);
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it

@@ -147,10 +147,10 @@ with the settings under [Build and run](#build-and-run).
 |-------|-------|
 | Boot, menus, start screen | work (30 fps) |
 | Cutscenes | play through; faces move (their 16-bit integer data now keeps its bits); shade is lit by a constant floor of light |
-| First mission (boat cutscene) | **about 9-10 fps** (run 193: 9.8 fps median, 102 ms a frame) |
-| Characters | mostly whole; one character's body is still missing in some shots |
+| First mission (boat cutscene) | **about 10 fps** (run 222: 10.4 fps median, 96 ms a frame) |
+| Characters | mostly whole; a few meshes come out of the skinning passes wrong, the same ones every frame (a body missing in the boat cutscene, a head in the opening one) |
 | Distant trees and buildings | left out: the title's impostors draw as huge flat panels on this layer |
-| Water | dark blocks in some shots |
+| Water | dark blocks, from the water's transmission volumetrics; leaving those two programs out removes them (the water turns grey) |
 | Ray-traced light and shadows | do not run; a constant floor of indirect light stands in |
 | Stability | runs end without a device loss |
 
