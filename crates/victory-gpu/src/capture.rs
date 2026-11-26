@@ -549,6 +549,19 @@ pub(crate) fn dump_slot_words() -> &'static [(u32, u32)] {
     })
 }
 
+/// The programs whose table buffer views the range dump also takes (card copy and title memory),
+/// up to 64 MiB each: those `FLAMINGO_DUMP_TABLE_AT=<part of a pipeline's name>` names, or with
+/// `FLAMINGO_DUMP_TABLE_VIEWS=1` the ones `FLAMINGO_DUMP_AT` names.
+pub(crate) fn dump_table_at() -> Option<&'static str> {
+    static AT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    AT.get_or_init(|| {
+        std::env::var("FLAMINGO_DUMP_TABLE_AT").ok().or_else(|| {
+            std::env::var_os("FLAMINGO_DUMP_TABLE_VIEWS").is_some_and(|v| v == "1").then(|| dump_at().to_owned())
+        })
+    })
+    .as_deref()
+}
+
 /// The indirect command [`note_ranges`] runs after: the first of a listed frame whose pipeline's
 /// name holds `FLAMINGO_DUMP_AT` (the character draws, `PedTransformPreSkinD`, without it).
 pub(crate) fn dump_at() -> &'static str {
@@ -558,18 +571,27 @@ pub(crate) fn dump_at() -> &'static str {
 
 /// At a character mesh draw: the ranges [`dump_ranges_asked`] names copied from their host
 /// copies into read-back buffers, once a listed frame.
-pub(crate) fn note_ranges(list: &crate::host::HostList, extra: &[(u64, u64)]) {
+pub(crate) fn note_ranges(list: &crate::host::HostList, extra: &[(u64, u64)], at_table: bool) {
     let frame = crate::queue::presented() + 1;
     if folder().is_none() || !listed(frame) {
         return;
     }
-    static TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if TAKEN.swap(frame, std::sync::atomic::Ordering::Relaxed) == frame {
-        return;
+    // Each range once a frame, at the first program that asks for it: every dispatch the
+    // pipeline name names may add the buffers of its own slots (FLAMINGO_DUMP_SLOT_WORD).
+    static TAKEN: std::sync::Mutex<(u64, Vec<u64>)> = std::sync::Mutex::new((0, Vec::new()));
+    let mut taken = TAKEN.lock().unwrap_or_else(|e| e.into_inner());
+    if taken.0 != frame {
+        *taken = (frame, Vec::new());
     }
-    let asked = dump_ranges_asked();
+    // With FLAMINGO_DUMP_TABLE_AT, the FLAMINGO_DUMP_RANGE ranges are taken at that program (the
+    // skinning outputs as the cull reads them), not at the first one FLAMINGO_DUMP_AT names.
+    let asked = if dump_table_at().is_some() && !at_table { Vec::new() } else { dump_ranges_asked() };
     let Some(host) = crate::host::host() else { return };
     for &(address, len) in asked.iter().chain(extra) {
+        if taken.1.contains(&address) {
+            continue;
+        }
+        taken.1.push(address);
         let Some(shadow) = crate::shadow::find(address, len) else {
             tracing::info!(address = format_args!("{address:#x}"), len, "range to dump has no host copy");
             continue;
