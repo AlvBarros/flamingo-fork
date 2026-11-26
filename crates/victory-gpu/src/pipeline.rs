@@ -710,6 +710,9 @@ static SHADERS_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
+/// Flamingo: `VICTORY_SKIP_PIPELINES` works in every build (the fast launcher leaves out the
+/// title's broken distant-object impostors with it); what was dropped is told only in
+/// diagnostics builds.
 #[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
@@ -744,7 +747,7 @@ pub(crate) fn skip_hashes() -> &'static [String] {
     })
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     let hashes = skip_hashes();
     if hashes.is_empty() {
@@ -756,7 +759,7 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
@@ -1017,6 +1020,14 @@ static FUNCTIONS: Table<24> = {
 
 #[cfg(windows)]
 pub(crate) mod host;
+
+/// Set the adapter-dependent translation settings before offline shader warm-up.
+#[cfg(windows)]
+pub fn prepare_shader_warmup() -> Result<(), String> {
+    crate::host::host().ok_or("could not initialize the runtime's D3D12 device for shader warm-up")?;
+    crate::descriptor::host::probe_view_limit();
+    Ok(())
+}
 #[cfg(windows)]
 mod library;
 

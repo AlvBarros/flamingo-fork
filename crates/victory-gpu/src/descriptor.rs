@@ -135,6 +135,49 @@ const SHADER_VISIBLE: u32 = 1;
 #[cfg(windows)]
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
+/// Diagnostics (Flamingo): for each shader-visible view heap, its size and
+/// how many of its slots hold a descriptor (any of the 32 bytes not zero),
+/// per block of 65,536 slots: whether the title fills slots past the host's
+/// 1,000,000.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn occupancy() -> String {
+    let heaps: Vec<(u64, u64, usize)> = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut out = String::new();
+    for (start, end, at) in heaps {
+        if !object::try_add_ref(at as This) {
+            continue;
+        }
+        let heap = HeapRef(at as *const Heap);
+        if heap.samplers() {
+            continue;
+        }
+        let slots = ((end - start) / 32) as usize;
+        let mut blocks = vec![0u32; slots.div_ceil(65_536)];
+        let (mut first, mut last) = (usize::MAX, 0);
+        let mut chunk = vec![0u8; 32 * 4096];
+        for base in (0..slots).step_by(4096) {
+            let n = (slots - base).min(4096);
+            if !crate::host::read_into((start + base as u64 * 32) as *const u8, &mut chunk[..n * 32]) {
+                continue;
+            }
+            for (k, slot) in chunk[..n * 32].chunks_exact(32).enumerate() {
+                if slot.iter().any(|&b| b != 0) {
+                    let i = base + k;
+                    blocks[i / 65_536] += 1;
+                    first = first.min(i);
+                    last = last.max(i);
+                }
+            }
+        }
+        let filled: u32 = blocks.iter().sum();
+        out += &format!(
+            "heap {start:#x}: {slots} slots, {filled} filled, first {first}, last {last}, past 1,000,000: {}\n  per 64K block: {blocks:?}\n",
+            blocks.iter().enumerate().map(|(b, &n)| if b * 65_536 >= 1_000_000 { n } else { 0 }).sum::<u32>()
+        );
+    }
+    out
+}
+
 /// One [`sync_heaps`] at a time, as when the list above was a mutex.
 #[cfg(windows)]
 static SYNCING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -226,6 +269,11 @@ pub(crate) fn sync_heaps() {
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
+        // Flamingo: the slots past the ones in place that shaders asked for get host slots
+        // (every view heap, placed or not).
+        if let Some(Some(host)) = heap.host.get() {
+            host.spill_take(start, crate::frame::current());
+        }
         let (Some(Some(host)), Some(written), Some(step)) =
             (heap.host.get(), &heap.written, increment(heap.desc.kind))
         else {
@@ -246,6 +294,14 @@ pub(crate) fn sync_heaps() {
                 page_bytes.resize(to - from, 0);
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
                     pages += 1;
+                    // Flamingo: spilled title slots the title wrote as bytes are made again.
+                    {
+                        let lo = (from as u64).saturating_sub(start) / step;
+                        let hi = ((to as u64).saturating_sub(start)).div_ceil(step);
+                        for index in lo.max(u64::from(mirrored_count))..hi {
+                            host.spill_rewrite(index as u32, start + index * step);
+                        }
+                    }
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // The page's records in one go, under one lock
                     // (`HostHeap::mirror_copied_page`); one by one below
@@ -1005,6 +1061,21 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     view_at(i, generation)
+}
+
+/// The view recorded at `handle`, and what says which record that is
+/// (`host::HostHeap::publish`).
+#[cfg(windows)]
+pub(crate) fn view_and_key(handle: u64) -> Option<(View, u64)> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: as in `view`.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return None;
+    }
+    Some((view_at(i, generation)?, u64::from(generation) << 32 | u64::from(i)))
 }
 
 /// A description of `N` words, if the title passes one.

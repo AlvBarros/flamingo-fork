@@ -164,7 +164,15 @@ fn card_limits() -> (u64, u64) {
         // the shader writes of the smaller buffers are then found by the
         // card's hashes too, and with that the first room's walls were
         // drawn in every run.
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
+        // Flamingo: `VICTORY_CARD_BUFFERS_MIN_KB` (from 4 KiB) in place of the MiB floor,
+        // as avatarmanz/VIctory-7900XTX's trees take it (64 with 1,536 MB in all: 18 fps
+        // on an RTX 4070 in one tester's tree, their issue #213).
+        let min = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|kb| (kb << 10).max(4 << 10))
+            .unwrap_or_else(|| mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20));
+        (min, mb("VICTORY_CARD_BUFFERS_MB", 1024))
     })
 }
 
@@ -2459,6 +2467,22 @@ impl Shadow {
     }
 
     /// The offset of a title address in the copy, if it lies in it.
+    /// Diagnostics: `len` bytes of the copy at title address `at` as its
+    /// mapping holds them now (what shaders wrote there, once they ran), if
+    /// the copy lives where the CPU reads it (not in the card's memory).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn peek(&self, at: u64, len: usize) -> Option<Vec<u8>> {
+        if self.card.is_some() || self.data.is_null() {
+            return None;
+        }
+        let off = self.offset_in(at)? as usize;
+        if off + len > self.len as usize {
+            return None;
+        }
+        // SAFETY: inside the copy's mapping (checked above).
+        Some(unsafe { std::slice::from_raw_parts(self.data.add(self.offset(at) as usize), len) }.to_vec())
+    }
+
     pub(crate) fn offset_in(&self, address: u64) -> Option<u64> {
         address.checked_sub(self.start).filter(|&at| at < self.len)
     }

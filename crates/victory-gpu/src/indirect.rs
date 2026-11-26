@@ -174,7 +174,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             for (uint j = 0; j < n; j++) {
                 uint c = costs[j];
                 if (c > 0 && next < BUDGET) {
-                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
+                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
                 }
             }
             if (next == before) break;
@@ -184,14 +184,27 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             before = prev;
         }
         uint at = before;
+        uint refused = 0;
+        uint biggest = 0;
         for (uint k = 0; k < n; k++) {
             uint c = costs[k];
             uint fit = 1;
             if (c > 0) {
                 fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
-                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
+                refused += 1 - fit;
+                biggest = max(biggest, c);
             }
             fits[k] = fit;
+        }
+        // Diagnostics: the records that run empty for want of budget, and
+        // the largest cost there was (small ones are not told).
+        uint told;
+        if (refused > 0) {
+            budget.InterlockedAdd(12, refused, told);
+        }
+        if (biggest >= (1u << 22)) {
+            budget.InterlockedMax(16, biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -258,7 +271,18 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
+/// Whether a record that does not fit in what is left of its list's budget
+/// takes the rest, so that every record after it runs empty too
+/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
+/// runs). A list whose budget one garbage record empties loses all its later
+/// draws, and which record that is may differ from frame to frame. The frame
+/// line says how many records a frame are refused (VIctory-7900XTX 449830f6).
+fn rest() -> u32 {
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
+}
+
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    let source = &format!("#define REST {}\n{source}", rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.

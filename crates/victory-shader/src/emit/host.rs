@@ -665,6 +665,8 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A root UAV backed by the given buffer in UAV readback order.
+    Uav(usize),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -902,7 +904,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Uav(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1029,10 +1031,12 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
-    /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
-    Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
+    Cube(u32, u16, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A raw buffer UAV initialized from these dwords.
+    RawUavData(&'a [u32]),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1205,20 +1209,23 @@ impl Host {
                 at.ptr += i * view_size;
                 match *v {
                     View::Texture(..) | View::Cube(..) => {
-                        let (w, h, texels, faces) = match *v {
-                            View::Texture(w, h, t) => (w, h, t, 1),
-                            View::Cube(n, t) => (n, n, t, 6),
+                        let (w, h, mut texels, faces, mips) = match *v {
+                            View::Texture(w, h, t) => (w, h, t, 1, 1),
+                            View::Cube(n, mips, t) => (n, n, t, 6, mips),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
                         desc.DepthOrArraySize = faces as u16;
+                        desc.MipLevels = mips;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        let pitch = (w as usize * 16).next_multiple_of(256);
-                        for face in 0..faces as usize {
+                        for sub in 0..u32::from(mips) * faces {
+                            let mip = sub % u32::from(mips);
+                            let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
+                            let pitch = (w as usize * 16).next_multiple_of(256);
                             let upload = make(
                                 D3D12_HEAP_TYPE_UPLOAD,
                                 &buffer((pitch * h as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
@@ -1226,9 +1233,10 @@ impl Host {
                             )?;
                             let mut p = std::ptr::null_mut();
                             upload.Map(0, None, Some(&mut p)).map_err(err)?;
-                            let texels = &texels[face * (w * h) as usize..];
+                            let (level, rest) = texels.split_at((w * h) as usize);
+                            texels = rest;
                             for y in 0..h as usize {
-                                let row = &texels[y * w as usize..(y + 1) * w as usize];
+                                let row = &level[y * w as usize..(y + 1) * w as usize];
                                 std::ptr::copy_nonoverlapping(
                                     row.as_ptr().cast::<u8>(),
                                     p.cast::<u8>().add(y * pitch),
@@ -1237,7 +1245,7 @@ impl Host {
                             }
                             upload.Unmap(0, None);
                             let mut at_face = subresource(&tex);
-                            at_face.Anonymous.SubresourceIndex = face as u32;
+                            at_face.Anonymous.SubresourceIndex = sub;
                             list.CopyTextureRegion(
                                 &at_face,
                                 0,
@@ -1259,7 +1267,7 @@ impl Host {
                             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
                             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                                 TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: 1,
+                                    MipLevels: u32::from(mips),
                                     ..Default::default()
                                 },
                             },
@@ -1271,7 +1279,11 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::RawUavData(_) | View::HalfUav(_) => {
+                        let initial = match *v {
+                            View::RawUavData(data) => Some(data),
+                            _ => None,
+                        };
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1283,14 +1295,28 @@ impl Host {
                             View::RawUav(n) => {
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
+                            View::RawUavData(data) => {
+                                let n = data.len() as u32;
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
                             _ => unreachable!(),
                         };
                         let bytes = u64::from(n) * 4;
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COMMON,
+                            if initial.is_some() { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_COMMON },
                         )?;
+                        if let Some(data) = initial {
+                            let src = upload(data)?;
+                            list.CopyBufferRegion(&b, 0, &src, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(src);
+                        }
                         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                             Format: format,
                             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
@@ -1436,6 +1462,12 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::Uav(index) => {
+                        let (resource, None, _, _) = uavs.get(*index).ok_or("missing root UAV")? else {
+                            return Err("a root UAV must be a buffer".into());
+                        };
+                        list.SetComputeRootUnorderedAccessView(*param, resource.GetGPUVirtualAddress());
                     }
                 }
             }

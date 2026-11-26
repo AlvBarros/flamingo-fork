@@ -9,8 +9,8 @@
 //! load, memory and the frame-time graph, as MSI Afterburner shows them),
 //! the full one (also what a frame costs: preparing submissions, copies,
 //! textures, waiting for the card, copying back, shaders, pipelines,
-//! dropped draws), and nothing. `FLAMINGO_OSD=1` starts with the compact
-//! display, `FLAMINGO_OSD=2` with the full one, `FLAMINGO_OSD=0` leaves it
+//! dropped draws), and nothing. It starts with the full display;
+//! `FLAMINGO_OSD=1` starts with the compact one, `FLAMINGO_OSD=0` leaves it
 //! out altogether.
 
 use std::sync::Mutex;
@@ -90,8 +90,7 @@ pub(crate) fn frame(hwnd: HWND) {
         MODE.store(
             match v.as_str() {
                 "1" => 1,
-                "2" => 2,
-                _ => 0,
+                _ => 2,
             },
             Ordering::Relaxed,
         );
