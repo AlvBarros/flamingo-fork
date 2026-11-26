@@ -29,6 +29,10 @@ set VICTORY_SKIP_PIPELINES=7115e46a79c78f98,59b1ba494f18c894,b8ca32a6899b87fb,65
 target\diag\victory.exe run <your dump>\<the title's executable> --execute --console series-s
 ```
 
+For water without the dark blocks, add `,5dc3b25986622949,6f225b641c5b0708` to
+`VICTORY_SKIP_PIPELINES`: the water's transmission volumetrics are left out, and the water turns
+grey instead of turquoise (run 221; see Water below).
+
 What each step gave, in order (same scenes):
 
 | Step | fps | |
@@ -60,6 +64,12 @@ victory-fork main is 79 commits ahead of this tree; a trial merge conflicts in 2
   now rides in the table of strides beside the stride, also for views in tables (VIctory
   4243a96a by way of avatarmanz/VIctory-7900XTX 9a6c829d and that fork's #114).
 - **The impostors are left out** (see below), which removes the biggest artifacts.
+- **The heap buffer pass looks at a third fewer slots.** The pass that makes the view heap's
+  buffer views ready for shaders that pick them by index marked every slot it made for the next
+  pass, which looked at each of them again for nothing (after victory-fork #1043): 14,089 slots a
+  frame looked at against 9,111 now, the pass 31.6 ms against 27.0 (runs 216, 220). It still runs
+  on the title's recording thread at about 2.6 us a slot, so it is the next speed target
+  (victory-fork #1190 and #1068 have more of it).
 
 ## Open: artifacts
 
@@ -88,6 +98,26 @@ impostor programs themselves translate in their original form (the mesh one has 
 `s_andn2_wrexec_b64` waterfall loops and 22 `v_readfirstlane_b32`).
 
 ### Characters
+
+**Newest (runs 204-219):** the meshes that go wrong come out of the skinning passes
+(`CS_PedStandardSkinning_*`) wrong, the same meshes in every frame. Dumped right after a skinning
+pass (`FLAMINGO_DUMP_AT` on direct dispatches), a few meshes it has just written hold coordinates
+far off or not finite: in one capture one mesh of the `_6` variant (`a97f7e8b86eb064f`) and two of
+`_9` (`ebe4e53f031f5249`), while other dispatches of `_9` are right. Each pass picks its geometry
+buffer (eight vertex streams: weights, bone indices, a half-float scale with 14 more channels)
+from the view heap by an index in its constant buffer (word 16) and a bone-remap buffer by
+another (word 17). For the wrong mesh those views are made, at the right size, and the card's
+copy of both buffers matches title memory byte for byte (`FLAMINGO_DUMP_SLOT_WORD=64:16,64:17`,
+run 219). So the data is right and the translated program, or the driver, gets it wrong. Read
+and found right: the typed 8_8_8_8 loads (format 56), the half conversion, the legacy multiplies
+(0 x anything = 0), the source modifiers. Next: replay that one dispatch with its dumped inputs
+on WARP and on the card, which tells translator from driver.
+
+The same family shows in the opening cutscene: one character is drawn without the skin of her
+head (teeth and the outline of eyes and glasses drawn), and a man's body is coarse facets with his
+hair as shards.
+
+Earlier notes, from before those runs:
 
 One character's body is still missing in most shots of the boat cutscene: head, neck, arms and
 legs drawn, torso and shirt not (seen on every captured frame of the boat, runs 193-203).
@@ -143,11 +173,17 @@ polygons. Not pinned yet.
 
 ### Other
 
-- Dark blocks on the water: up close they are unions of screen tiles with a horizontal smear
-  inside, so a tiled water or reflection pass (the water's tile classification and resolve, or
-  its reflection tiles) gives some tiles the wrong content. They show in every configuration.
+- **Water:** the dark blocks come from the water's transmission volumetrics,
+  `CS_TransmissionVolumetrics_Tiled` (`5dc3b25986622949`) and `_Tiled_LocalLights`
+  (`6f225b641c5b0708`): with both left out the blocks are gone and the water turns grey (run 221).
+  Their wave form is not the cause: in the exact paired form (`VICTORY_WAVE_WIDE_ONLY` without
+  them; by default they take the wave-wide form, after victory-fork #823) the turquoise and the
+  blocks both come back (run 222). So one of their ~40 inputs is wrong; the sun's shadow atlas
+  they read (640x2560, four cascades) looks right. victory-fork reached the same two programs
+  (its commit 9613092b: "gives the water its colour but leaves dark patches on it").
 - Dark blocks on the horizon remain in some shots even with the impostors left out; a large dark
   triangle sticks up from the boat in one shot; one shot shows broken shards.
+- **Textures waiting for room:** from about a minute in, 5,400-11,000 textures picked by index wait for room on the card for the rest of the run (the store keeps to 90% of its budget, `VICTORY_TEXTURE_ROOM_PERCENT`; run 223's log). A texture that never gets there draws dark, which may be part of the dark faces and black silhouettes; to test next.
 - `VICTORY_RELAY=0` turns skin grey and makes eyes glow: do not use it for picture checks.
 - The water's GPU-written textures are copied back by default (`texback.rs`); with
   `VICTORY_TEXTURE_BACK=0` the boat sits on the seabed. Keep it on.
@@ -160,6 +196,8 @@ polygons. Not pinned yet.
 | + `VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_BUFFERS_MB=1536` (run 203) | **11.1** | the card's time 13 ms a frame against 28; picture as mixed as before. From avatarmanz/VIctory-7900XTX's issue #213 (18 fps on an RTX 4070 in another tree) |
 | + `VICTORY_WAIT_FORCE=0` (run 202) | 10.6 | held work kept across presents; can stop the title for good if a wait is never met |
 | + `VICTORY_LATE_WAIT_LISTS=512 VICTORY_MERGE_RUNS=4096` (run 197) | 9.0 | much worse picture |
+| + the 1,034 ray-traced resolve programs skipped (run 206) | 10.4 | 7 ms less preparing; no artifact gone |
+| the heap buffer pass fix (run 220) | 10.0 | the pass 31.6 to 27.0 ms a frame |
 
 ## Tools added this round
 
@@ -182,3 +220,23 @@ polygons. Not pinned yet.
   limits).
 - `translate --warm` of one hash with `VICTORY_WAVE_WHY=1` and a scratch `VICTORY_CACHE_DIR`
   prints which wave64 form a program takes on a 32-lane host.
+- `FLAMINGO_DUMP_SLOTS=<index,...>` and `FLAMINGO_DUMP_SLOT_WORD=<table dword>:<word>,...`
+  (diagnostics builds, with a capture): at the pipelines `FLAMINGO_DUMP_AT` names, the op lines
+  describe those view heap slots as the title wrote them and as the host made them, and the range
+  dump takes their buffers (card copy and title memory). `64:16,64:17` at
+  `CS_PedStandardSkinning` gives the skinning passes' geometry and bone-remap buffers.
+
+## Elsewhere: projects worth reading
+
+Searched on 2026-11-26 among the Xbox Series compatibility layers on GitHub (about 70; the ones
+named after the title's executable or promising a "PC edition" look like scams and were not
+opened):
+
+- ZigZagBoi1/ScarlettPort (license not stated: ideas only): links mesh programs whose outputs
+  pass D3D12's 32 KiB (this tree does too) and sizes the view heap for NVIDIA (here the title's
+  1,245,184 slots meet a host cap of 1,000,000; run 155 found shaders almost never pick past it).
+- alexdeliu/rdna2-conformance (MIT): driver probes for console RDNA2-to-DXIL translators, with
+  vectors from this lowering; NVIDIA results are asked for. A way to tell a driver bug from ours.
+- californiaAlmonds/OpenScarlett (MIT, C++20): its own GFX10 translator, another reference.
+- fxceless/victory-fork #1043, #1190, #1068: more of the heap pass speed-up; upstream VIctory
+  #1567: skinning that read zeros through null heap slots (handled here already).

@@ -1863,6 +1863,13 @@ impl HostHeap {
     /// stale ([`Spans`]): out of the queue of textures already, their host
     /// slots are the caller's to make null (it holds `made`).
     fn note_buffer(&self, index: u32, view: Option<&View>, seen: bool) -> Vec<u32> {
+        self.note_buffer_marking(index, view, seen, true)
+    }
+
+    /// As [`Self::note_buffer`]; `mark`: a buffer view's slot is marked for the next heap
+    /// buffer pass ([`Self::buffer_changes`]). Not by that pass itself, which takes the slot in
+    /// where it makes it.
+    fn note_buffer_marking(&self, index: u32, view: Option<&View>, seen: bool, mark: bool) -> Vec<u32> {
         if self.sampler {
             return Vec::new();
         }
@@ -1952,7 +1959,7 @@ impl HostHeap {
         } else {
             buffers.remove(&index)
         };
-        if was {
+        if was && mark {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2282,6 +2289,18 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_marking(index, handle, for_draw, true)
+    }
+
+    /// As [`Self::mirror`] for a draw, for the heap buffer pass itself: the slot is not marked
+    /// for the next pass. The pass takes in the copy of every slot it makes, but each one it
+    /// made was marked again, and the next pass looked at it once more for nothing: half the
+    /// slots it looked at, some 15 ms of a 150 ms frame (after fxceless/victory-fork#1043).
+    pub(crate) fn mirror_unmarked(&self, index: u32, handle: u64) -> Option<View> {
+        self.mirror_marking(index, handle, true, false)
+    }
+
+    fn mirror_marking(&self, index: u32, handle: u64, for_draw: bool, mark: bool) -> Option<View> {
         if index >= self.count && self.spill_rewrite(index, handle) {
             return None;
         }
@@ -2322,7 +2341,7 @@ impl HostHeap {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
+            for stale in self.note_buffer_marking(index, Some(&view), for_draw, mark) {
                 if stale != index {
                     self.unmake(&mut made, stale);
                 }
@@ -3864,6 +3883,26 @@ mod tests {
         assert_eq!(spans.slots_holding(at + 0x20000, at + 0x21000), [3]);
         assert_eq!(spans.slots_holding(at + 0x32000, at + 0x33000), [] as [u32; 0]);
         assert_eq!(spans.slots_holding(at + 0x2000, at + 0x2000), [] as [u32; 0]);
+    }
+
+    /// A buffer view's slot is marked for the next heap buffer pass when it is noted, but not
+    /// when that pass notes it itself.
+    #[test]
+    fn the_heap_buffer_pass_does_not_mark_the_slots_it_makes() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // A raw view of 64 bytes, at an address no test and no title uses.
+        let at = 0x7fee_0000_0000u64;
+        let mut desc = [0u32; 16];
+        desc[..10].copy_from_slice(&[39, 1, 5768, 0, 0, 0, 16, 0, 1, 0]);
+        (desc[10], desc[11]) = (at as u32, (at >> 32) as u32);
+        let view = View::Placed(false, [1, 0, 0, 0, 64, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0], desc);
+        let _ = heap.note_buffer_marking(2, Some(&view), true, false);
+        assert_eq!(heap.buffer_changes(), [] as [u32; 0]);
+        let _ = heap.note_buffer(3, Some(&view), false);
+        assert_eq!(heap.buffer_changes(), [3]);
+        assert_eq!(heap.buffer_slots(), [2, 3]);
     }
 
     /// A write behind the guards' back under a placed texture: a slot
