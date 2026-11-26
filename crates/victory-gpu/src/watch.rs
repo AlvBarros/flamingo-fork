@@ -833,18 +833,81 @@ fn covered(ranges: &[(usize, usize)], first: usize, last: usize) -> bool {
 
 /// Whether to keep views' not-clean blocks in a set and answer from it
 /// ([`Guards::unclean`], [`Guards::parked`]; `VICTORY_VIEW_SET=0` walks
-/// every block of a range, as before). Only where Windows tells
-/// placeholders apart ([`placeholders_told`]).
+/// every block of a range, as before). Only where placeholders are told
+/// apart ([`placeholders_told`]).
 fn view_set() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_SET").is_none_or(|v| v != "0") && placeholders_told())
 }
 
-/// Whether [`in_placeholder`] knows a placeholder, asked once of one of
-/// our own. Where it does not (Wine may not fill the flag), every parked
-/// block would be looked at each epoch, more questions than the walk
-/// asks: the walk stays there.
+/// Whether [`in_placeholder`] knows a placeholder: the system's answer
+/// ([`kernel_tells_placeholders`]), or else the runtime's own placeholder
+/// reservations ([`title_placeholder_reserved`]; `VICTORY_RUNTIME_PLACEHOLDERS=0`
+/// does without them).
 fn placeholders_told() -> bool {
+    static TOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TOLD.get_or_init(|| {
+        if kernel_tells_placeholders_now() {
+            return true;
+        }
+        let runtime = std::env::var_os("VICTORY_RUNTIME_PLACEHOLDERS").is_none_or(|v| v != "0");
+        tracing::info!(
+            "Windows does not tell placeholders apart here: {}",
+            if runtime {
+                "the runtime's own placeholder reservations do (VICTORY_RUNTIME_PLACEHOLDERS=0: view memory askings walk every block)"
+            } else {
+                "view memory askings walk every block (VICTORY_VIEW_SET)"
+            }
+        );
+        runtime
+    })
+}
+
+/// Flamingo: the runtime's placeholder reservations (xmem's 64 KiB-page
+/// reservations), in blocks, in order and joined. Where the system does not
+/// tell placeholders apart (Wine fills no flag for them), [`in_placeholder`]
+/// answers from these: without it, every parked block would be looked at
+/// each epoch, more questions than the walk over every block asks, so the
+/// view set stayed off and each guarded asking walked every block (about
+/// 7,500 protection changes and 2,800 region questions a frame of the
+/// opening cutscene under Proton).
+///
+/// shortcut: a placeholder the title releases itself (not through the
+/// runtime) stays here; an ordinary reservation made later at its addresses
+/// would be taken for one, its blocks found uncommitted not looked at again
+/// each epoch, only when the runtime maps or commits there.
+static PLACEHOLDERS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// The runtime reserved `[at, at + len)` as a placeholder (`XMemVirtualAlloc`
+/// for 64 KiB pages): see [`PLACEHOLDERS`].
+pub fn title_placeholder_reserved(at: usize, len: usize) {
+    let mut p = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    add_range(&mut p, at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+}
+
+/// `[at, at + len)` is no placeholder reservation any more ([`PLACEHOLDERS`]).
+pub fn title_placeholder_released(at: usize, len: usize) {
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let mut p = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut kept = Vec::with_capacity(p.len() + 1);
+    for &(a, b) in p.iter() {
+        if b <= first || last <= a {
+            kept.push((a, b));
+            continue;
+        }
+        if a < first {
+            kept.push((a, first));
+        }
+        if last < b {
+            kept.push((last, b));
+        }
+    }
+    *p = kept;
+}
+
+/// Whether [`kernel_in_placeholder`] knows a placeholder, asked once of one
+/// of our own.
+fn kernel_tells_placeholders() -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_RELEASE, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, VirtualAlloc2, VirtualFree,
     };
@@ -864,12 +927,9 @@ fn placeholders_told() -> bool {
     if p == 0 {
         return false;
     }
-    let told = in_placeholder(p / BLOCK);
+    let told = kernel_in_placeholder(p / BLOCK);
     // SAFETY: our own placeholder, known to nothing else.
     unsafe { VirtualFree(p as _, 0, MEM_RELEASE) };
-    if !told {
-        tracing::info!("Windows does not tell placeholders apart here: view memory askings walk every block (VICTORY_VIEW_SET)");
-    }
     told
 }
 
@@ -921,8 +981,24 @@ fn park(g: &mut Guards, block: usize) {
     }
 }
 
-/// Whether `block` lies in a placeholder.
+/// Whether `block` lies in a placeholder: the system says, or where it does
+/// not, the runtime's placeholder reservations ([`PLACEHOLDERS`]).
 fn in_placeholder(block: usize) -> bool {
+    if kernel_tells_placeholders_now() {
+        return kernel_in_placeholder(block);
+    }
+    let p = PLACEHOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+    covered(&p, block, block + 1)
+}
+
+/// [`kernel_tells_placeholders`], asked once.
+fn kernel_tells_placeholders_now() -> bool {
+    static TELLS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TELLS.get_or_init(kernel_tells_placeholders)
+}
+
+/// Whether the system says `block` lies in a placeholder.
+fn kernel_in_placeholder(block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MemoryRegionInfo, QueryVirtualMemoryInformation, WIN32_MEMORY_REGION_INFORMATION,
     };
@@ -2062,6 +2138,44 @@ mod tests {
         unsafe { VirtualFree(p as _, 0, MEM_RELEASE) };
     }
 
+    /// A placeholder the runtime reserved is one, an ordinary reservation
+    /// is not: the system says so, or where it does not (Wine), the
+    /// runtime's own reservations do; and the view set stays on either way.
+    #[test]
+    fn the_runtimes_placeholders_are_told_apart() {
+        use windows_sys::Win32::System::Memory::{MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, VirtualAlloc2};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        if std::env::var_os("VICTORY_RUNTIME_PLACEHOLDERS").is_some_and(|v| v == "0") {
+            return;
+        }
+        // SAFETY: a fresh placeholder of two blocks.
+        let placeholder = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                2 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            )
+        } as usize;
+        assert_ne!(placeholder, 0);
+        title_placeholder_reserved(placeholder, 2 * BLOCK);
+        // SAFETY: a fresh ordinary reservation of two blocks.
+        let ordinary = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(ordinary, 0);
+        assert!(placeholders_told());
+        assert!(in_placeholder(placeholder / BLOCK) && in_placeholder(placeholder / BLOCK + 1));
+        assert!(!in_placeholder(ordinary / BLOCK));
+        title_placeholder_released(placeholder, 2 * BLOCK);
+        // SAFETY: our own reservations, known to nothing else now.
+        unsafe {
+            VirtualFree(placeholder as _, 0, MEM_RELEASE);
+            VirtualFree(ordinary as _, 0, MEM_RELEASE);
+        }
+    }
+
     /// A range of view memory whose first block is not mapped is a view
     /// all the same: its blocks are reported once, then the ones written
     /// or mapped since.
@@ -2097,6 +2211,8 @@ mod tests {
             assert!(!section.is_null());
             (p, section)
         };
+        // Told of as the runtime tells of its placeholders (`xmem`).
+        title_placeholder_reserved(p, 3 * BLOCK);
         let map = |block: usize| {
             // SAFETY: splits the placeholder at the block and maps the
             // section's block there.
@@ -2152,6 +2268,7 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, 3 * BLOCK);
+        title_placeholder_released(p, 3 * BLOCK);
     }
 
     /// Blocks of a placeholder between views are reported once, then not
@@ -2189,6 +2306,8 @@ mod tests {
             assert!(!section.is_null());
             (p, section)
         };
+        // Told of as the runtime tells of its placeholders (`xmem`).
+        title_placeholder_reserved(p, 3 * BLOCK);
         let map = |block: usize| {
             // SAFETY: splits the placeholder at the block and maps the
             // section's block there.
@@ -2244,6 +2363,7 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, 3 * BLOCK);
+        title_placeholder_released(p, 3 * BLOCK);
     }
 
     /// A pagefile section mapped twice: two views of the same physical

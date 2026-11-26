@@ -171,6 +171,12 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && kind & MEM_COMMIT != 0 {
         victory_gpu::title_memory_committed(at as usize, size);
     }
+    // A placeholder: the GPU side knows it as one where the system does not
+    // say (Wine), and keeps its blocks found uncommitted out of the looks
+    // it takes now and then.
+    if !at.is_null() && kind & MEM_RESERVE_PLACEHOLDER != 0 {
+        victory_gpu::title_placeholder_reserved(at as usize, size);
+    }
     at
 }
 
