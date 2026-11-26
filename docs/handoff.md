@@ -139,6 +139,11 @@ op dump does not show), and for those 14 it did not arrive. `VICTORY_PAGE_WRITES
 change it (run 228). Next: record the title's buffer copies in the op dump and capture the frames
 where the characters stream in, to find what writes those buffers and why it reads stale data.
 
+**Runs 237-238:** making every title buffer copy on the card in the list's order (instead of, or
+as well as, in title memory) turned the whole scene black, since it also changes the ordinary
+per-frame copies; reverted. The narrower test, only copies into buffers that buffer views picked
+from the view heap read, is next.
+
 Earlier notes, from before those runs:
 
 One character's body is still missing in most shots of the boat cutscene: head, neck, arms and
