@@ -27,7 +27,10 @@ export WINEDEBUG="${WINEDEBUG:--all}"
 # vkd3d-proton's own pipeline cache, kept out of the working directory.
 export VKD3D_SHADER_CACHE_PATH="${VKD3D_SHADER_CACHE_PATH:-$FORK_HOME/vkd3d-cache}"
 mkdir -p "$VKD3D_SHADER_CACHE_PATH"
-WINE="$PROTON_DIR/files/bin/wine"
+# FORK_WINE: another Wine than Proton's (e.g. /usr/bin/wine), for a Wine
+# whose development files are installed (winegcc); Proton still provides
+# vkd3d-proton and DXVK, copied into the prefix (fork_vkd3d).
+WINE="${FORK_WINE:-$PROTON_DIR/files/bin/wine}"
 
 # True for a Microsoft build of the DLL (Wine's own says "Wine builtin DLL").
 fork_is_ms_compiler() {
@@ -69,6 +72,14 @@ fork_vkd3d() {
     src="$PROTON_DIR/files/lib/wine/vkd3d-proton/x86_64-windows"
     dst="$WINEPREFIX/drive_c/windows/system32"
     [ -d "$src" ] && [ -d "$dst" ] || return 0
+    # With FORK_WINE the prefix has the Wine's own dxgi/d3d11 (wined3d):
+    # DXVK's from Proton go in too, as `proton` puts them in its prefixes.
+    dxvk="$PROTON_DIR/files/lib/wine/dxvk/x86_64-windows"
+    if [ -n "$FORK_WINE" ] && [ -d "$dxvk" ]; then
+        for dll in dxgi.dll d3d11.dll; do
+            cmp -s "$dxvk/$dll" "$dst/$dll" || { rm -f "$dst/$dll" && install -m 755 "$dxvk/$dll" "$dst/$dll"; }
+        done
+    fi
     for dll in d3d12.dll d3d12core.dll; do
         if [ -f "$src/$dll" ] && ! cmp -s "$src/$dll" "$dst/$dll"; then
             # Replaced, not written through: Proton ships them read-only, and

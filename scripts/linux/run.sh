@@ -72,9 +72,13 @@ winpath() { printf 'Z:%s' "$(realpath "$1")" | tr / '\\'; }
 # First run: let Proton create the prefix and install vkd3d-proton/DXVK into it.
 if [ ! -d "$FORK_HOME/prefix/pfx" ]; then
     echo "creating the Wine prefix (once)..."
-    STEAM_COMPAT_DATA_PATH="$FORK_HOME/prefix" \
-    STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.steam/steam" \
-        "$PROTON_DIR/proton" run "$EXE" config >/dev/null 2>&1 || true
+    if [ -n "$FORK_WINE" ]; then
+        "$WINE" wineboot -u >/dev/null 2>&1 || true
+    else
+        STEAM_COMPAT_DATA_PATH="$FORK_HOME/prefix" \
+        STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.steam/steam" \
+            "$PROTON_DIR/proton" run "$EXE" config >/dev/null 2>&1 || true
+    fi
 fi
 
 # Proton's wine run directly does not apply the d3d12/dxgi overrides by
@@ -96,6 +100,7 @@ fork_header() {
         echo "== run.sh $* ($(date '+%Y-%m-%d %H:%M:%S'))"
         echo "source     $(git -C "$ROOT" describe --always --dirty 2>/dev/null || echo '?') (victory.exe built $(date -r "$EXE" '+%Y-%m-%d %H:%M'))"
         echo "proton     $PROTON_DIR ($(head -c 200 "$PROTON_DIR/version" 2>/dev/null | cut -d' ' -f2))"
+        echo "wine       $WINE ($("$WINE" --version 2>/dev/null))"
         echo "vkd3d      $(cut -d' ' -f2- "$PROTON_DIR/files/lib/wine/vkd3d-proton/version" 2>/dev/null || echo '?')"
         echo "driver     NVIDIA $(grep -o '[0-9]\{3\}\.[0-9]*\.[0-9]*' /proc/driver/nvidia/version 2>/dev/null | head -1)"
         echo "fork_home  $FORK_HOME"
