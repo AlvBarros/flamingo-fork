@@ -118,6 +118,10 @@ pub enum T {
     /// blocks that became so.
     HotKept,
     HotNew,
+    /// `VICTORY_VERIFY=1` (`crate::watch`): clean blocks hashed again, and
+    /// of them the ones whose bytes had changed with no write reported.
+    VerifyChecked,
+    VerifyStale,
     Count,
 }
 
@@ -434,7 +438,7 @@ fn text(f: &Frame) -> String {
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0} \
          | memory watch, all threads: {:.0} write-watch askings ({:.0} refused) {:.1} ms over {:.0} MB; {:.0} protection changes \
-         {:.1} ms; {:.0} region queries {:.1} ms; hot set: {:.0} blocks left unguarded, {:.0} new",
+         {:.1} ms; {:.0} region queries {:.1} ms; hot set: {:.0} blocks left unguarded, {:.0} new; verify: {:.0} clean blocks checked, {:.0} stale",
         f.us / 1e3,
         (s(S_THREAD_USER) + s(S_THREAD_KERNEL)) / 1e3,
         s(S_THREAD_USER) / 1e3,
@@ -503,6 +507,8 @@ fn text(f: &Frame) -> String {
         t(T::QueryNs) / 1e6,
         t(T::HotKept),
         t(T::HotNew),
+        t(T::VerifyChecked),
+        t(T::VerifyStale),
     )
 }
 

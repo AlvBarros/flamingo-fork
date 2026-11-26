@@ -723,6 +723,10 @@ struct Guards {
     hot_seen: BTreeMap<usize, (u64, u8)>,
     /// The blocks left unguarded, with the frame each became so.
     hot: BTreeMap<usize, u64>,
+    /// Flamingo, `VICTORY_VERIFY=1` ([`verify`]): a hash of each clean
+    /// block's bytes as they were when it was guarded (just before its
+    /// copies took them).
+    sums: BTreeMap<usize, u64>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -779,7 +783,94 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     viewed: BTreeSet::new(),
     hot_seen: BTreeMap::new(),
     hot: BTreeMap::new(),
+    sums: BTreeMap::new(),
 });
+
+/// Flamingo: `VICTORY_VERIFY=1`, a check of the memory watch itself. A block
+/// is clean from the moment it is guarded (just before its copies take its
+/// bytes) until a write opens it: its bytes cannot change meanwhile. Here each
+/// block's bytes are hashed when it is guarded, and now and then the blocks
+/// still clean are hashed again; a difference is a write nothing reported
+/// (the GPU writing through memory in place, a write through a view not
+/// guarded, the kernel), so copies of it keep stale bytes. Counted in the
+/// frame log ("verify: ... stale") and the first ones logged with their block.
+/// Costly: for checking a change, not for playing.
+fn verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VERIFY").is_some_and(|v| v == "1"))
+}
+
+/// A hash of block `block`'s bytes, `None` if they cannot be read now.
+fn block_sum(block: usize) -> Option<u64> {
+    let mut bytes = vec![0u8; BLOCK];
+    if !try_copy(bytes.as_mut_ptr(), (block * BLOCK) as *const u8, BLOCK) {
+        return None;
+    }
+    // FNV-1a over 64-bit words: enough to tell bytes that changed.
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for word in bytes.chunks_exact(8) {
+        h ^= u64::from_le_bytes(word.try_into().unwrap_or([0; 8]));
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    Some(h)
+}
+
+/// Notes the bytes of blocks `[from, to)`, guarded and clean now ([`verify`]).
+fn verify_note(g: &mut Guards, from: usize, to: usize) {
+    for block in from..to {
+        match block_sum(block) {
+            Some(sum) => {
+                g.sums.insert(block, sum);
+            }
+            None => {
+                g.sums.remove(&block);
+            }
+        }
+    }
+}
+
+/// One asking in 32 ([`verify`]): up to 32 blocks of `[first, last)` that
+/// are still clean are hashed again and compared.
+fn verify_check(g: &mut Guards, first: usize, last: usize) {
+    static ASKINGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if ASKINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 32 != 0 {
+        return;
+    }
+    verify_check_now(g, first, last);
+}
+
+/// [`verify_check`] without the sampling: how many blocks were stale.
+fn verify_check_now(g: &mut Guards, first: usize, last: usize) -> u64 {
+    use crate::framelog::{T, add};
+    let mut stale = 0;
+    let blocks: Vec<usize> = g.clean.range(first..last).copied().filter(|b| g.sums.contains_key(b)).take(32).collect();
+    for block in blocks {
+        let Some(now) = block_sum(block) else { continue };
+        add(T::VerifyChecked, 1);
+        if g.sums.get(&block) != Some(&now) {
+            let n = add_stale();
+            if n <= 20 {
+                tracing::warn!(
+                    block = format_args!("{:#x}", block * BLOCK),
+                    aliased = g.aliased.contains(&block),
+                    hot = g.hot.contains_key(&block),
+                    views = crate::inplace::pages_of(block * BLOCK).len(),
+                    "verify: a clean block's bytes changed with no write reported: its copies are stale (VICTORY_VERIFY)"
+                );
+            }
+            g.sums.insert(block, now);
+            stale += 1;
+        }
+    }
+    stale
+}
+
+/// Counts a stale block ([`verify_check`]); how many so far.
+fn add_stale() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    crate::framelog::add(crate::framelog::T::VerifyStale, 1);
+    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
 
 /// Flamingo: the hot set's switches, `None` when it is off
 /// (`VICTORY_HOT_SET=0`): after how many frames in a row a view block found
@@ -1247,6 +1338,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
+                if verify() {
+                    verify_note(&mut g, block, block + 1);
+                }
                 g.clean.insert(block);
             } else if !stays_hot(&mut g, block, frame) && !alias_hot(&g, block) {
                 run.get_or_insert(block);
@@ -1280,6 +1374,9 @@ fn guard_unclean(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
         g.unclean.extend(fresh);
         add_range(&mut g.views, first, last);
     }
+    if verify() {
+        verify_check(g, first, last);
+    }
     let unclean: Vec<usize> = g.unclean.range(first..last).copied().collect();
     let mut written = Vec::new();
     if unclean.is_empty() {
@@ -1310,6 +1407,9 @@ fn guard_unclean(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
         if g.protected.contains(&block) {
             // Written through the runtime, or guarded with another view of
             // its page: still read-only.
+            if verify() {
+                verify_note(g, block, block + 1);
+            }
             g.clean.insert(block);
             g.unclean.remove(&block);
             flush(g, &mut run);
@@ -1521,6 +1621,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         })
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
+        if verify() {
+            verify_note(g, from, to);
+        }
         g.protected.extend(from..to);
         g.clean.extend(from..to);
         for block in from..to {
@@ -1851,6 +1954,10 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in hot {
         g.hot.remove(&block);
         g.hot_seen.remove(&block);
+    }
+    let summed: Vec<usize> = g.sums.range(range.clone()).map(|(&b, _)| b).collect();
+    for block in summed {
+        g.sums.remove(&block);
     }
     let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
@@ -2599,6 +2706,41 @@ mod tests {
         drop_views(section, &[guarded, other], SIZE);
     }
 
+    /// `VICTORY_VERIFY` ([`verify_check_now`]): a clean block whose bytes
+    /// changed with no write reported is found, once.
+    #[test]
+    fn verify_finds_a_clean_block_changed_with_no_write_reported() {
+        let mut g = Guards {
+            protected: BTreeSet::new(),
+            clean: BTreeSet::new(),
+            absent: BTreeSet::new(),
+            aliased: BTreeSet::new(),
+            views: Vec::new(),
+            unclean: BTreeSet::new(),
+            parked: BTreeSet::new(),
+            parked_ordinary: BTreeSet::new(),
+            parked_at: 0,
+            viewed: BTreeSet::new(),
+            hot_seen: BTreeMap::new(),
+            hot: BTreeMap::new(),
+            sums: BTreeMap::new(),
+        };
+        // SAFETY: two blocks of the test's own, read-write (not guarded:
+        // the test plays the write that went around the guard).
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let (first, last) = (p / BLOCK, p / BLOCK + 2);
+        g.clean.extend(first..last);
+        verify_note(&mut g, first, last);
+        assert_eq!(verify_check_now(&mut g, first, last), 0, "nothing changed");
+        // SAFETY: inside the second block.
+        unsafe { ((p + BLOCK + 100) as *mut u8).write_volatile(0x77) };
+        assert_eq!(verify_check_now(&mut g, first, last), 1, "the second block changed with no write reported");
+        assert_eq!(verify_check_now(&mut g, first, last), 0, "noted, not reported twice");
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as _, 0, MEM_RELEASE) };
+    }
+
     /// The hot set ([`stays_hot`]): a view block found written in
     /// `VICTORY_HOT_AFTER` frames in a row stays unguarded until it cools
     /// down after `VICTORY_HOT_FRAMES`; askings in the same frame do not
@@ -2621,6 +2763,7 @@ mod tests {
             viewed: BTreeSet::new(),
             hot_seen: BTreeMap::new(),
             hot: BTreeMap::new(),
+            sums: BTreeMap::new(),
         };
         let block = 7;
         // Written in `after` frames in a row: hot from the last of them.
