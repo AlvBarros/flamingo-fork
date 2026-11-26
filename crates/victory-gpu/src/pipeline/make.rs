@@ -346,6 +346,32 @@ fn next() -> Arc<Pending> {
 const MENU_WORKERS: usize = 2;
 static WORLD: AtomicBool = AtomicBool::new(false);
 
+/// Flamingo: when a worker last finished a pipeline (`crate::host::now_ms`).
+static LAST_MADE: AtomicU64 = AtomicU64::new(0);
+
+/// Flamingo: pipelines wait and none was made for five seconds. A host
+/// driver can hang making a pipeline and never return (under Proton on
+/// NVIDIA: 32ed072b9f845048 and fdd56d97a806bcca, among others): with both
+/// menu workers held so, nothing more was made, the world's draws were all
+/// dropped, a frame never reached the world's sixty draws, and the other
+/// workers never started (about 2,200 pipelines "being made" for a whole
+/// run). Then the other workers start, as for the world: at worst one is
+/// held by each pipeline that hangs.
+fn stuck() -> bool {
+    let last = LAST_MADE.load(Ordering::Relaxed);
+    if WAITING.load(Ordering::Relaxed) == 0 || last == 0 || crate::host::now_ms() < last + 5_000 {
+        return false;
+    }
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            waiting = WAITING.load(Ordering::Relaxed),
+            "no host pipeline made for 5 s while pipelines wait (a driver may hang on one): every pipeline worker starts"
+        );
+    }
+    true
+}
+
 /// At every present, with the draws run on the host so far: a frame of many
 /// draws is the world's (menus run about ten).
 pub(crate) fn frame_drew(drawn: u64) {
@@ -374,10 +400,11 @@ fn workers() -> bool {
                     loop {
                         // All of them during the intro and the menus starve
                         // the title's threads: frames come unevenly.
-                        while i >= MENU_WORKERS && !WORLD.load(Ordering::Relaxed) {
+                        while i >= MENU_WORKERS && !WORLD.load(Ordering::Relaxed) && !stuck() {
                             std::thread::sleep(Duration::from_millis(50));
                         }
                         next().make();
+                        LAST_MADE.store(crate::host::now_ms(), Ordering::Relaxed);
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
