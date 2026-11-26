@@ -3774,6 +3774,12 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         crate::capture::note_drawn(list, kind, arguments, &bounded, at);
+        // Flamingo diagnostics: the skinned vertices as the characters' draws read them
+        // (`FLAMINGO_DUMP_RANGE`).
+        #[cfg(feature = "diagnostics")]
+        if kind == MESH && p.name.contains("PedTransformPreSkinD") {
+            crate::capture::note_ranges(list);
+        }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
@@ -4078,7 +4084,16 @@ fn describe(view: Option<&View>) -> String {
         {
             // SAFETY: 16 committed bytes of title memory.
             let v = unsafe { (*address as *const [f32; 4]).read_unaligned() };
-            format!("Constant({address:#x}, {size}) {v:?}")
+            // Flamingo: a small buffer's every dword too (the skinning passes' output offsets).
+            let words = if *size <= 128 && crate::texture::committed(*address as *const u8, *size as usize) {
+                // SAFETY: `size` committed bytes of title memory.
+                let bytes = unsafe { std::slice::from_raw_parts(*address as *const u8, *size as usize) };
+                let w: Vec<String> = bytes.chunks_exact(4).map(|c| format!("{:x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect();
+                format!(" words [{}]", w.join(" "))
+            } else {
+                String::new()
+            };
+            format!("Constant({address:#x}, {size}) {v:?}{words}")
         }
         Some(v) => format!("{v:?}").chars().take(60).collect(),
     }
