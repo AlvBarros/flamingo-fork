@@ -577,8 +577,12 @@ pub(crate) fn note_ranges(list: &crate::host::HostList, extra: &[(u64, u64)], at
         return;
     }
     // Each range once a frame, at the first program that asks for it: every dispatch the
-    // pipeline name names may add the buffers of its own slots (FLAMINGO_DUMP_SLOT_WORD).
-    static TAKEN: std::sync::Mutex<(u64, Vec<u64>)> = std::sync::Mutex::new((0, Vec::new()));
+    // pipeline name names may add the buffers of its own slots (FLAMINGO_DUMP_SLOT_WORD). The
+    // FLAMINGO_DUMP_RANGE ranges at the FLAMINGO_DUMP_TABLE_AT programs are copied again at each
+    // of them into the same read-back buffer: the file holds them as the frame's last such
+    // program left them (with the skinning passes named: all of the frame's skinning done).
+    type Taken = (u64, Vec<(u64, Option<(ID3D12Resource, usize, usize)>)>);
+    static TAKEN: std::sync::Mutex<Taken> = std::sync::Mutex::new((0, Vec::new()));
     let mut taken = TAKEN.lock().unwrap_or_else(|e| e.into_inner());
     if taken.0 != frame {
         *taken = (frame, Vec::new());
@@ -587,27 +591,40 @@ pub(crate) fn note_ranges(list: &crate::host::HostList, extra: &[(u64, u64)], at
     // skinning outputs as the cull reads them), not at the first one FLAMINGO_DUMP_AT names.
     let asked = if dump_table_at().is_some() && !at_table { Vec::new() } else { dump_ranges_asked() };
     let Some(host) = crate::host::host() else { return };
+    let barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        ..Default::default()
+    };
     for &(address, len) in asked.iter().chain(extra) {
-        if taken.1.contains(&address) {
+        let again = at_table && asked.contains(&(address, len));
+        if let Some((_, kept)) = taken.1.iter().find(|e| e.0 == address) {
+            if let (true, Some((back, bytes, n))) = (again, kept)
+                && let Some(shadow) = crate::shadow::find(address, len)
+            {
+                // SAFETY: as below, into the read-back buffer the first copy made.
+                unsafe {
+                    list.list.ResourceBarrier(std::slice::from_ref(&barrier));
+                    list.list.CopyBufferRegion(back, 0, &shadow.buffer, shadow.offset(address), len);
+                }
+                list.defer_read_back(back.clone(), *bytes as *mut u8, [*n, 1, *n]);
+            }
             continue;
         }
-        taken.1.push(address);
         let Some(shadow) = crate::shadow::find(address, len) else {
+            taken.1.push((address, None));
             tracing::info!(address = format_args!("{address:#x}"), len, "range to dump has no host copy");
             continue;
         };
         let Some(back) = host.read_back_buffer(len) else { continue };
         let bytes: &'static mut [u8] = Box::leak(vec![0u8; len as usize].into_boxed_slice());
-        let barrier = D3D12_RESOURCE_BARRIER {
-            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-            ..Default::default()
-        };
         // SAFETY: an open list; the copy's buffer lives while the list does (the list keeps
         // the read-back buffer), and the range is inside it.
         unsafe {
-            list.list.ResourceBarrier(&[barrier]);
+            list.list.ResourceBarrier(std::slice::from_ref(&barrier));
             list.list.CopyBufferRegion(&back, 0, &shadow.buffer, shadow.offset(address), len);
         }
+        let kept = again.then(|| (back.clone(), bytes.as_mut_ptr() as usize, len as usize));
+        taken.1.push((address, kept));
         list.defer_read_back(back, bytes.as_mut_ptr(), [len as usize, 1, len as usize]);
         RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((frame, address, bytes.as_ptr() as usize, len as usize));
     }

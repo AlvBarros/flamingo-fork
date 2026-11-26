@@ -178,7 +178,7 @@ TdrDelay raised to 60 s. Here TdrDelay is the default 2 s. Keep test runs short.
 | 106 | + victory-fork #854: wave64 programs in the paired form on 32-lane GPUs | no pipeline refused, no program untranslated (the cascades' alpha shadow program translates); rows of black boxes on the water |
 | 107, 108 | + `FLAMINGO_BVH_MISS=1` (every ray misses) | the black boxes on the water gone (light streaks left where reflections take their fallback); a cutscene face well lit; no hang in two runs. On in the newest-code launcher |
 
-### Runs 146-235 (2026-11-25 and 26)
+### Runs 146-236 (2026-11-25 and 26)
 
 Runs 109 to 145 are not logged here. From run 185 on: the Series S profile, the lean build, the
 first mission's boat cutscene. What was found, and what to look at next: [docs/handoff.md](docs/handoff.md).
@@ -235,6 +235,7 @@ first mission's boat cutscene. What was found, and what to look at next: [docs/h
 | 225, 226 | the skinning programs with the driver asked not to optimize (`FLAMINGO_DXIL_STRICT`, test switch) | 225 cold pipelines (2.4 fps, not a test); 226: the floating heads stay: not the driver's optimizer |
 | 227, 228 | `VICTORY_PAGE_WRITES=1`, `=all` | the dark faces stay; they are right a few seconds into each shot: texture latency at camera cuts |
 | 229-235 | every input of the skinning passes dumped (`FLAMINGO_DUMP_TABLE_AT`, `FLAMINGO_DUMP_SLOT_WORD`) | geometry, bone-remap and the bone palette's rows right on the card; a mesh right just after its own pass; a few meshes' geometry decoded on the card (title memory keeps the encoded form) and right there too. Output dumps at the first cull come too early (it is recorded before the skinning) |
+| 236 | the skinning outputs copied after every skinning pass, the last copy kept (`FLAMINGO_DUMP_TABLE_AT` at the skinning passes) | in one frame's skinning (125 passes) 14 meshes come out wrong, and every one of them has a geometry buffer whose card copy is not decoded vertex data; no mesh whose card copy matches title memory is wrong. Title memory holds an encoded container for all such buffers; the card holds the decoded streams for the 15 that come out right |
 
 ## Stats overlay
 

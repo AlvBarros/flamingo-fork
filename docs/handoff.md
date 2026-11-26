@@ -128,6 +128,17 @@ skinning and the draws (the order of lists, or a write after the pass). Dumping 
 the copy after the last skinning pass: the first pre-skinned cull of a frame is recorded before
 almost all of its skinning.
 
+**Run 236, the clearest so far:** with the skinning outputs copied after the frame's last
+skinning pass (one frame, 125 passes), 14 meshes come out wrong, and each of them reads a geometry
+buffer whose card copy does not hold decoded vertex streams (one holds floats in the hundreds, one
+a fill pattern, one what looks like another mesh). For every such buffer title memory holds an
+encoded container (a header of tagged chunk offsets, `42 40 00 00 26 ...`); the 15 that come out
+right have the decoded streams on the card. So the decoded data reaches the card some other way
+than through title memory (a decode pass at load time, or a copy from an upload buffer the
+op dump does not show), and for those 14 it did not arrive. `VICTORY_PAGE_WRITES=all` does not
+change it (run 228). Next: record the title's buffer copies in the op dump and capture the frames
+where the characters stream in, to find what writes those buffers and why it reads stale data.
+
 Earlier notes, from before those runs:
 
 One character's body is still missing in most shots of the boat cutscene: head, neck, arms and
@@ -241,7 +252,9 @@ polygons. Not pinned yet.
   `CS_PedStandardSkinning` gives the skinning passes' geometry and bone-remap buffers.
 - `FLAMINGO_DUMP_TABLE_AT=<part of a pipeline's name>`: the range dump also takes every buffer that
   program reads or writes through its tables (up to 64 MiB each), and the `FLAMINGO_DUMP_RANGE`
-  ranges are taken there; each range is taken once a frame, at the first program that asks.
+  ranges are taken there; each range is taken once a frame, at the first program that asks. At each program
+  `FLAMINGO_DUMP_TABLE_AT` names the `FLAMINGO_DUMP_RANGE` ranges are copied again into the same
+  read-back buffer, so the file holds them as the frame's last such program left them.
 
 ## Elsewhere: projects worth reading
 
