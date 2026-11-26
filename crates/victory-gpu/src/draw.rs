@@ -3125,6 +3125,8 @@ impl State {
                 } else {
                     crate::descriptor::view(handle)
                 };
+                // What shaders ask of a typed view in a table: its kind (after XTX #114).
+                host.dynamic_word(index, view.as_ref());
                 match view {
                     Some(View::Constant(address, size)) => {
                         if required_cbv && (!valid_immutable_cbv(address, size)

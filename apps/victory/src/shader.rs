@@ -168,8 +168,14 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                     }
                     None => "no parsable DXIL program".to_owned(),
                 } + &native;
-                if verbose {
-                    println!("{}{}: {line}", path.display(), source.label());
+                // Flamingo: `FLAMINGO_DISASM_HASHES` (hash prefixes, comma-separated) prints
+                // only the containers whose hash (as a run's log names shaders) starts with one.
+                let hash = blake3::hash(&bytes).to_hex();
+                let wanted = std::env::var("FLAMINGO_DISASM_HASHES")
+                    .map(|v| v.split(',').map(str::trim).any(|h| !h.is_empty() && hash.starts_with(h)))
+                    .unwrap_or(true);
+                if verbose && wanted {
+                    println!("{}{} {}: {line}", path.display(), source.label(), &hash[..16]);
                     for l in &listing {
                         println!("{l}");
                     }
