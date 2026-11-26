@@ -77,6 +77,12 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Flamingo: `place` over view memory (`crate::inplace`, level 3): the
+    /// heap is the runtime's section, and other views show the same pages.
+    /// What shaders write here is noted written at all of them once the
+    /// submission has run ([`Shadow::copy_back_done`]), so copies of those
+    /// views (textures, aliases) take it.
+    view: bool,
     /// Flamingo: the frame (plus one) whose lists last declared shader
     /// writes here ([`Shadow::gpu_wrote_lately`]); 0 if none ever did.
     gpu_wrote: AtomicU64,
@@ -2150,7 +2156,7 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::gone(self.window, self.len, self.view);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -2491,6 +2497,7 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
+        shadow.view = placed.view;
         shadow.place = Some((placed.heap, placed.bias));
         shadow
     }
@@ -2535,6 +2542,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            view: false,
             gpu_wrote: AtomicU64::new(0),
         }
     }
@@ -2569,7 +2577,11 @@ impl Shadow {
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        // Flamingo: in place over view memory the range is declared all the
+        // same (no snapshot, no copy-back: `writing` and `copy_back_with`
+        // stop at once), so that once the submission has run the pages are
+        // noted written at every view that shows them ([`Shadow::copy_back_done`]).
+        if self.place.is_some() && !self.view {
             return;
         }
         let len = len.min(self.left(address));
@@ -3006,6 +3018,14 @@ impl Shadow {
     /// last submission that declared it is ([`Flights`]).
     pub(crate) fn copy_back_done(&self, ranges: &[(usize, usize)]) {
         if self.place.is_some() {
+            // In place over view memory: the shaders wrote the runtime's
+            // pages themselves; every view of them (and the copies made of
+            // those) learns it now, as from a write by the runtime.
+            if self.view {
+                for &(start, end) in ranges {
+                    crate::watch::title_memory_written(start, end.saturating_sub(start), true);
+                }
+            }
             return;
         }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
