@@ -718,6 +718,11 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+    /// Flamingo, the hot set ([`stays_hot`]): view blocks found written
+    /// lately, with the frame they last were and how many frames in a row.
+    hot_seen: BTreeMap<usize, (u64, u8)>,
+    /// The blocks left unguarded, with the frame each became so.
+    hot: BTreeMap<usize, u64>,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -772,7 +777,91 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     parked_ordinary: BTreeSet::new(),
     parked_at: 0,
     viewed: BTreeSet::new(),
+    hot_seen: BTreeMap::new(),
+    hot: BTreeMap::new(),
 });
+
+/// Flamingo: the hot set's switches, `None` when it is off
+/// (`VICTORY_HOT_SET=0`): after how many frames in a row a view block found
+/// written stays unguarded (`VICTORY_HOT_AFTER`, 3), and for how many frames
+/// before it is guarded again to see whether it still is (`VICTORY_HOT_FRAMES`,
+/// 120).
+fn hot_params() -> Option<(u8, u64)> {
+    static P: std::sync::OnceLock<Option<(u8, u64)>> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        if std::env::var_os("VICTORY_HOT_SET").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let num = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).filter(|&n: &u64| n > 0).unwrap_or(default);
+        Some((num("VICTORY_HOT_AFTER", 3).min(255) as u8, num("VICTORY_HOT_FRAMES", 120)))
+    })
+}
+
+/// Flamingo: the hot set. A view block the title writes every frame went
+/// round the guard's whole cycle every frame: made read-only, a fault at
+/// the title's write, given write access back, made read-only again at the
+/// next copy; two protection changes and a fault a block a frame, to learn
+/// what the frame before had said already. Under Wine each of those is
+/// dear (a frame of the opening cutscene: 5,000-9,500 protection changes,
+/// about half a second). A block `block` found written now (by `frame`):
+/// whether it is left unguarded, which keeps it not clean, so every asking
+/// that covers it reports it written and its copies take it. That is
+/// always safe (a copy of unchanged bytes); what it costs is copies.
+fn stays_hot(g: &mut Guards, block: usize, frame: u64) -> bool {
+    use crate::framelog::{T, add};
+    let Some((after, frames)) = hot_params() else {
+        return false;
+    };
+    if let Some(&since) = g.hot.get(&block) {
+        if frame.saturating_sub(since) < frames {
+            add(T::HotKept, 1);
+            return true;
+        }
+        // Cooled down: guarded again; if the title still writes it every
+        // frame it is back in `after` frames.
+        g.hot.remove(&block);
+        g.hot_seen.remove(&block);
+        return false;
+    }
+    let streak = match g.hot_seen.get_mut(&block) {
+        // Written again in the same frame (another asking): no change.
+        Some(seen) if seen.0 == frame => seen.1,
+        // Written in one of the last two frames: a streak goes on (a block
+        // need not be asked about in every frame its memory is written).
+        Some(seen) if frame <= seen.0 + 2 => {
+            *seen = (frame, seen.1.saturating_add(1));
+            seen.1
+        }
+        _ => {
+            g.hot_seen.insert(block, (frame, 1));
+            1
+        }
+    };
+    if streak >= after {
+        g.hot_seen.remove(&block);
+        g.hot.insert(block, frame);
+        add(T::HotNew, 1);
+        return true;
+    }
+    // Blocks written once and never again: forgotten now and then.
+    if g.hot_seen.len() > 1 << 18 {
+        g.hot_seen.retain(|_, seen| frame <= seen.0 + 2);
+    }
+    false
+}
+
+/// Whether another view of `block`'s physical page is in the hot set: that
+/// view is left writable, so the title writes the page through it with no
+/// fault, and `block`'s copies must take the page at every asking as well
+/// (left unguarded, not clean), or they would keep stale bytes. Only blocks
+/// known to share their page are looked up.
+fn alias_hot(g: &Guards, block: usize) -> bool {
+    if g.hot.is_empty() || !g.aliased.contains(&block) {
+        return false;
+    }
+    let shown = crate::inplace::pages_of(block * BLOCK);
+    shown.len() <= MANY_VIEWS && shown.iter().any(|&alias| alias / BLOCK != block && g.hot.contains_key(&(alias / BLOCK)))
+}
 
 /// Tests: `[start, end)` is no longer known as view memory. A test's own
 /// allocation can land where an earlier test's views were, which the view
@@ -1097,6 +1186,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     if view_set() {
         return Some(guard_unclean(&mut g, first, last));
     }
+    let frame = crate::frame::current();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     // The range's clean blocks, in order: read off the set in one pass,
@@ -1133,10 +1223,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
-            } else {
+            } else if !stays_hot(&mut g, block, frame) && !alias_hot(&g, block) {
                 run.get_or_insert(block);
                 continue;
             }
+            // Written every frame: left unguarded, not clean ([`stays_hot`]).
         }
         if let Some(from) = run.take() {
             protect(&mut g, from, block);
@@ -1155,6 +1246,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// guarded again in runs).
 fn guard_unclean(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
     use std::sync::atomic::Ordering::Relaxed;
+    let frame = crate::frame::current();
     unpark_committed(g);
     if !covered(&g.views, first, last) {
         let fresh: Vec<usize> = (first..last)
@@ -1195,6 +1287,12 @@ fn guard_unclean(g: &mut Guards, first: usize, last: usize) -> Vec<usize> {
             // its page: still read-only.
             g.clean.insert(block);
             g.unclean.remove(&block);
+            flush(g, &mut run);
+            continue;
+        }
+        // Written every frame, here or at another view of the page: left
+        // unguarded, still not clean ([`stays_hot`], [`alias_hot`]).
+        if stays_hot(g, block, frame) || alias_hot(g, block) {
             flush(g, &mut run);
             continue;
         }
@@ -1287,7 +1385,9 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             for alias in shown {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
-                if alias != block && !g.protected.contains(&alias) {
+                // A hot alias stays unguarded ([`stays_hot`]): guarding it
+                // with this block made it fault again every frame.
+                if alias != block && !g.protected.contains(&alias) && !g.hot.contains_key(&alias) {
                     alias_blocks.push(alias);
                 }
             }
@@ -1720,6 +1820,12 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
+    }
+    // Other memory shows there now: the hot set starts over for it.
+    let hot: Vec<usize> = g.hot.range(range.clone()).map(|(&b, _)| b).chain(g.hot_seen.range(range.clone()).map(|(&b, _)| b)).collect();
+    for block in hot {
+        g.hot.remove(&block);
+        g.hot_seen.remove(&block);
     }
     let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
@@ -2466,6 +2572,51 @@ mod tests {
         writing(other + BLOCK / 2, BLOCK);
         assert_eq!(guard(guarded, guarded + SIZE), Some(vec![pages(0), pages(1)]));
         drop_views(section, &[guarded, other], SIZE);
+    }
+
+    /// The hot set ([`stays_hot`]): a view block found written in
+    /// `VICTORY_HOT_AFTER` frames in a row stays unguarded until it cools
+    /// down after `VICTORY_HOT_FRAMES`; askings in the same frame do not
+    /// count twice, and a gap of more than two frames starts over.
+    #[test]
+    fn hot_set_takes_blocks_written_frame_after_frame() {
+        let Some((after, frames)) = hot_params() else {
+            return;
+        };
+        let mut g = Guards {
+            protected: BTreeSet::new(),
+            clean: BTreeSet::new(),
+            absent: BTreeSet::new(),
+            aliased: BTreeSet::new(),
+            views: Vec::new(),
+            unclean: BTreeSet::new(),
+            parked: BTreeSet::new(),
+            parked_ordinary: BTreeSet::new(),
+            parked_at: 0,
+            viewed: BTreeSet::new(),
+            hot_seen: BTreeMap::new(),
+            hot: BTreeMap::new(),
+        };
+        let block = 7;
+        // Written in `after` frames in a row: hot from the last of them.
+        for k in 0..u64::from(after) {
+            assert!(!stays_hot(&mut g, block, 10 + k) || k + 1 == u64::from(after));
+            // Another asking in the same frame changes nothing.
+            if k + 1 < u64::from(after) {
+                assert!(!stays_hot(&mut g, block, 10 + k));
+            }
+        }
+        let became = 10 + u64::from(after) - 1;
+        assert!(g.hot.contains_key(&block));
+        assert!(stays_hot(&mut g, block, became + frames - 1), "still hot");
+        // Cooled down: guarded again, and hot again only after another streak.
+        assert!(!stays_hot(&mut g, block, became + frames));
+        assert!(!g.hot.contains_key(&block));
+        // A gap of more than two frames starts the streak over.
+        let other = 9;
+        assert!(!stays_hot(&mut g, other, 100));
+        assert!(!stays_hot(&mut g, other, 104));
+        assert_eq!(g.hot_seen.get(&other), Some(&(104, 1)));
     }
 
     /// Both views of the pages are checked, each for a copy of its own
