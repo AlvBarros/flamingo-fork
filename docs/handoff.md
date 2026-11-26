@@ -89,8 +89,33 @@ impostor programs themselves translate in their original form (the mesh one has 
 
 ### Characters
 
-One character's body is still missing in some shots of the boat cutscene (head, neck and
-necklace drawn). What was ruled out, with the data:
+One character's body is still missing in most shots of the boat cutscene: head, neck, arms and
+legs drawn, torso and shirt not (seen on every captured frame of the boat, runs 193-203).
+
+What the pre-skinned meshlet cull (`CS_BatchCullPreSkinnedMeshlets`) does, from its code: it
+reads vertex i of a mesh at the mesh's skinned offset + 32 + i x stride (float3, 24:24:16 or
+10:10:10, each axis mapped onto -3..3 m), places a vertex left all ones (the skinning's "not
+written") at the mesh's origin, moves it by the instance matrix and two 4x4 matrices, and keeps
+a meshlet when any of its vertices lies inside the view (|x/w| < 1, |y/w| < 1, z/w > 0); the
+group ORs that in LDS between two barriers.
+
+What it reads (run 201: the skinning outputs and the batch ring dumped right after the main
+cull, `FLAMINGO_DUMP_AT`): most meshes hold plausible skinned vertices (about +-0.4 m round the
+instance), some with 15-62 % left all ones (likely skin under clothes, hidden on purpose). A few
+hold stale data: one mesh coordinates around 100,000 m, one all zeros, one every vertex at one
+point; the cull drops those. Each of them is written by a skinning dispatch recorded *after* the
+cull, in a list the title submits only after the next present; that list waits for the cloth
+simulation's completion value, and the cull's list is held behind a list that waits for a value
+of the compute queue's water simulation. Keeping held work across presents
+(`VICTORY_WAIT_FORCE=0`, run 202) did not bring the body back, so the order the title expects
+between those lists is the open question. Next: capture four windows in a row and replay the
+queues' order offline.
+
+Note for dumps: the skinning outputs' title addresses change from run to run (0xfb2600000 and
+0xfb5800000 in runs 181-184; 0xac6160000 and 0xac9360000 in run 201): dump them by size,
+`FLAMINGO_DUMP_RANGE=size:3200000,size:1900000,size:ae00000`.
+
+What was ruled out earlier, with the data:
 
 - The skinning output is consistent. With `FLAMINGO_DUMP_RANGE` (below) the two skinning
   buffers were dumped at frames 2850 and 3000: everything the frame's skinning dispatches write
@@ -110,13 +135,31 @@ skinned vertices, the optional back-face test), or the draws themselves. Next st
 colour draw's record to its mesh and character, and test that character's meshlets on the CPU
 from the dumps.
 
+More on the impostors (runs 192-195, judged on every captured frame, not six): with all 17
+programs that take a local-wave form put in the exact paired form (`VICTORY_WAVE_LOCAL=0`) no
+full-screen olive panel showed in 20 frames; with only the four batch culls exact (194) it
+showed in three, with only the four tile classifiers exact (195) none but many large dark
+polygons. Not pinned yet.
+
 ### Other
 
-- Dark blocks on the water and the horizon remain in some shots even with the impostors left
-  out; a large dark triangle sticks up from the boat in one shot; one shot shows broken shards.
+- Dark blocks on the water: up close they are unions of screen tiles with a horizontal smear
+  inside, so a tiled water or reflection pass (the water's tile classification and resolve, or
+  its reflection tiles) gives some tiles the wrong content. They show in every configuration.
+- Dark blocks on the horizon remain in some shots even with the impostors left out; a large dark
+  triangle sticks up from the boat in one shot; one shot shows broken shards.
 - `VICTORY_RELAY=0` turns skin grey and makes eyes glow: do not use it for picture checks.
 - The water's GPU-written textures are copied back by default (`texback.rs`); with
   `VICTORY_TEXTURE_BACK=0` the boat sits on the seabed. Keep it on.
+
+## Speed switches tried this afternoon (same scenes, Series S)
+
+| Switches | fps | |
+|----------|-----|-|
+| the README's settings (run 193) | 9.8 | |
+| + `VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_BUFFERS_MB=1536` (run 203) | **11.1** | the card's time 13 ms a frame against 28; picture as mixed as before. From avatarmanz/VIctory-7900XTX's issue #213 (18 fps on an RTX 4070 in another tree) |
+| + `VICTORY_WAIT_FORCE=0` (run 202) | 10.6 | held work kept across presents; can stop the title for good if a wait is never met |
+| + `VICTORY_LATE_WAIT_LISTS=512 VICTORY_MERGE_RUNS=4096` (run 197) | 9.0 | much worse picture |
 
 ## Tools added this round
 
@@ -132,5 +175,10 @@ from the dumps.
 - Test switches (off by default): `FLAMINGO_GATHER_ZERO=1` (gathers at a named level read 0:
   occlusion off), `FLAMINGO_LIST_BARRIER=1` (a barrier at the start of every list).
 - `VICTORY_SKIP_PIPELINES` works in every build.
+- `FLAMINGO_DUMP_AT=<part of a pipeline's name>`: the ranges are dumped right after the first
+  indirect command of that pipeline in a listed frame (the main character cull:
+  `CS_BatchCullPreSkinnedMeshlets_b589f3cd`), not at the first character draw.
+- `shader-info --disasm` prints each program's wave size and stage I/O (threads, LDS, mesh
+  limits).
 - `translate --warm` of one hash with `VICTORY_WAVE_WHY=1` and a scratch `VICTORY_CACHE_DIR`
   prints which wave64 form a program takes on a 32-lane host.

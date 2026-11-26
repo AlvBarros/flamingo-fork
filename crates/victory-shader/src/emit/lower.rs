@@ -795,20 +795,25 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     // per region: LDS reads, LDS writes
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
+    let lds_op = |i: &Inst| {
+        let name = i.name();
+        (matches!(i.fields, Fields::Ds { .. }) && !name.starts_with("ds_swizzle") && !name.contains("permute"))
+            .then_some(name)
+    };
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
         }
         let r = find(&mut region, b);
-        for i in &block.insts {
-            let name = i.name();
-            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
-                continue;
-            }
+        for name in block.insts.iter().filter_map(lds_op) {
             if name.starts_with("ds_read") {
                 reads[r] = true;
             } else {
                 writes[r] = true;
+                // An atomic reads the word it changes (avatarmanz/VIctory-7900XTX #204): an
+                // atomic minimum and an add in one region, split in two host waves, could
+                // run the other half's minimum after this half's add.
+                reads[r] |= !(name.starts_with("ds_write_b") || name.starts_with("ds_write2"));
             }
         }
     }
@@ -818,6 +823,18 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
     for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
+        // (one kind of commuting reduction that returns nothing, alone in the region: any
+        // order of the two halves leaves the same word)
+        let mut ops = blocks.iter().flat_map(|&b| p.blocks[b].insts.iter().filter_map(lds_op));
+        if let Some(op) = ops.next()
+            && matches!(
+                op,
+                "ds_add_u32" | "ds_sub_u32" | "ds_and_b32" | "ds_or_b32" | "ds_xor_b32" | "ds_min_i32" | "ds_max_i32" | "ds_min_u32" | "ds_max_u32"
+            )
+            && ops.all(|next| next == op)
+        {
+            continue;
+        }
         // Flamingo, with victory-fork #799: else the loose fallback, if on.
         if !(flags_on && lds_flag_region(p, st, &blocks)) && !LDS_LOOSE.get() {
             return None;
@@ -12557,6 +12574,39 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// In a lane branch of a console wave64 program, an LDS atomic minimum and then an add
+    /// on one word: split in two host waves, the halves need ordering inside the branch
+    /// (`super::lds_meetings` refuses the region), where two adds alone commute and do not
+    /// (avatarmanz/VIctory-7900XTX #204).
+    #[test]
+    fn lds_atomics_of_two_kinds_in_a_lane_branch_need_ordering() {
+        let meets = |first: u32, second: u32| {
+            let words: [u32; 13] = [
+                0x7E12_0280, // v_mov_b32 v9, 0 (address and minimum)
+                0x7E04_0281, // v_mov_b32 v2, 1 (increment)
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0004, // s_cbranch_execz past both atomics
+                0x36 << 26 | first << 18,
+                9 << 8 | 9, // ds_<first> v9, v9
+                0x36 << 26 | second << 18,
+                2 << 8 | 9,  // ds_<second> v9, v2
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                0x36 << 26 | 0x36 << 18,
+                5 << 24 | 9, // ds_read_b32 v5, v9
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let p = ir::build(&code, true, 16).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let all = super::all_lane_blocks(&st).unwrap();
+            super::lds_meetings(&p, &st, &all).is_some()
+        };
+        assert!(!meets(0x07, 0x00), "ds_min_u32 then ds_add_u32");
+        assert!(!meets(0x07, 0x20), "ds_min_u32 then ds_add_rtn_u32");
+        assert!(meets(0x00, 0x00), "two ds_add_u32");
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {

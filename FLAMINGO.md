@@ -46,6 +46,9 @@ GPL-2.0 and VIctory is GPL-3.0, so code is not copied between them.
 | 16-bit typed accesses through integer views pass bits, also for views in descriptor tables (the view's format kind rides in the table of strides): the face network's output was garbage | VIctory 4243a96a by way of avatarmanz/VIctory-7900XTX 9a6c829d, that fork's #114 and 4e3e0654 |
 | Textures picked by index uploaded by a thread of their own (`VICTORY_HEAP_WORKER=1`) | victory-fork d4a528ba (from its pull request #1007) |
 | `VICTORY_SKIP_PIPELINES` in every build: the settings leave out the title's impostors | Flamingo |
+| Wave64 on 32-lane hosts: an LDS atomic counts as a read too where the two host waves of a console wave must meet round a lane branch (an atomic minimum and an add on one word could run in the wrong order between the halves) | avatarmanz/VIctory-7900XTX #204 |
+| `VICTORY_CARD_BUFFERS_MIN_KB`: card copies of title buffers from that size up, in place of the 1 MiB floor | Flamingo, after avatarmanz/VIctory-7900XTX's trees |
+| Diagnostics: `FLAMINGO_DUMP_AT`; `shader-info --disasm` gives each program's wave size and stage I/O | Flamingo |
 | Diagnostics: the arguments indirect commands ran with (`frame-N-drawn.txt`), heap occupancy, title ranges dumped from their host copies and from title memory (`FLAMINGO_DUMP_RANGE`), mesh pipelines' state and small constant buffers in captures, `FLAMINGO_DISASM_HASHES`; test switches `FLAMINGO_GATHER_ZERO=1` and `FLAMINGO_LIST_BARRIER=1` | Flamingo |
 
 How this tree is put together: the scratch branch `flamingo-wip` (a worktree in the session's
@@ -206,7 +209,14 @@ first mission's boat cutscene. What was found, and what to look at next: [docs/h
 | 189 | `VICTORY_AMBIENT=0.6` | shade no longer black; 9.2 fps |
 | 190, 191 | the impostors' pixel programs left out (`VICTORY_SKIP_PIPELINES`): all four (190), the mesh impostors' two (191) | 190: the olive panels, most dark blocks on the water and the dark boxes over the beach gone, a body back in several shots; far trees and buildings missing. 191: the panels gone, the water blocks and the missing body stay: those come from the vertex-shader impostors |
 | 192 | impostors drawn, `VICTORY_WAVE_LOCAL=0` (the tree and prop culls in the exact paired form) | a body back, but the dark water blocks stay and a long spike polygon appears; 7.8 fps |
-| 193 | the README's settings (impostors left out) | **9.8 fps** (102 ms a frame: 46 preparing, 29 on the GPU). Some dark blocks on the water and the horizon; a dark triangle on the boat in one shot |
+| 193 | the README's settings (impostors left out) | **9.8 fps** (102 ms a frame: 46 preparing, 29 on the GPU). Some dark blocks on the water and the horizon; a dark triangle on the boat in one shot. On all 20 frames: a character's body missing in almost every boat shot, water blocks in nearly every water shot |
+| 194 | impostors drawn, the four batch culls in the exact paired form | olive full-screen panels in three frames, planks and bands; 9.0 fps |
+| 195 | impostors drawn, the four tile classifiers in the exact paired form | no full-screen panel; many large dark polygons; water blocks; 8.3 fps |
+| 196 | capture with every target dumped (`VICTORY_DUMP_TARGETS`) | the G-buffer has the characters' heads but not torsos and shirts; the subsurface-scattering buffer has them whole |
+| 197 | + `VICTORY_LATE_WAIT_LISTS=512 VICTORY_MERGE_RUNS=4096` | 9.0 fps, much worse picture (black and olive frames). Not used |
+| 198-201 | captures of consecutive frames; the skinning outputs dumped at the main cull | at the main cull most meshes hold this frame's skinned vertices; a few hold stale data, written by skinning recorded after the cull (see docs/handoff.md) |
+| 202 | + `VICTORY_WAIT_FORCE=0` | 10.6 fps; the body still missing |
+| 203 | + `VICTORY_CARD_BUFFERS_MIN_KB=64 VICTORY_CARD_BUFFERS_MB=1536` | **11.1 fps**, the card's time 13 ms; the body drawn in two shots more, a large flat panel in three |
 
 ## Stats overlay
 

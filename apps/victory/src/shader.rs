@@ -122,6 +122,9 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                                         *t.unnamed.entry(key).or_default() += 1;
                                     }
                                     if disasm {
+                                        // (Flamingo: the wave size and the stage's threads and
+                                        // LDS, which decide how a 32-lane host splits it)
+                                        listing.push(format!("    wave64 {} {:?}", n.wave64, n.io));
                                         listing
                                             .extend(n.layout.iter().map(|p| format!("    {p:?}")));
                                         listing.extend(n.used.iter().map(|u| format!("    {u:?}")));

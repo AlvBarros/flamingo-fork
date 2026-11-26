@@ -519,6 +519,13 @@ fn dump_ranges_asked() -> Vec<(u64, u64)> {
         .collect()
 }
 
+/// The indirect command [`note_ranges`] runs after: the first of a listed frame whose pipeline's
+/// name holds `FLAMINGO_DUMP_AT` (the character draws, `PedTransformPreSkinD`, without it).
+pub(crate) fn dump_at() -> &'static str {
+    static AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    AT.get_or_init(|| std::env::var("FLAMINGO_DUMP_AT").unwrap_or_else(|_| "PedTransformPreSkinD".into()))
+}
+
 /// At a character mesh draw: the ranges [`dump_ranges_asked`] names copied from their host
 /// copies into read-back buffers, once a listed frame.
 pub(crate) fn note_ranges(list: &crate::host::HostList) {

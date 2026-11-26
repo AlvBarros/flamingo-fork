@@ -90,6 +90,12 @@ Pull requests merged from victory-fork and VIctory that have not landed upstream
   several at a time.
 - victory-fork d4a528ba (its pull request #1007's worker; opt-in, `VICTORY_HEAP_WORKER=1`):
   textures picked by index are uploaded by a thread of their own (7.1 to 9.1 fps here).
+- avatarmanz/VIctory-7900XTX #204: on 32-lane GPUs, LDS atomics in a lane branch keep their order
+  between the two halves of a console wave.
+
+Being tried (see [docs/handoff.md](docs/handoff.md)): `VICTORY_CARD_BUFFERS_MIN_KB=64
+VICTORY_CARD_BUFFERS_MB=1536` keeps every title buffer from 64 KB up on the card: 11.1 fps in the
+boat cutscene against 9.8, with the picture as mixed as before.
 
 Experiments, all off by default, kept for testing (each has its result in FLAMINGO.md):
 

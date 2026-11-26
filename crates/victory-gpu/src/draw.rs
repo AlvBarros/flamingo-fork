@@ -3831,9 +3831,10 @@ impl State {
         #[cfg(feature = "diagnostics")]
         crate::capture::note_drawn(list, kind, arguments, &bounded, at);
         // Flamingo diagnostics: the skinned vertices as the characters' draws read them
-        // (`FLAMINGO_DUMP_RANGE`).
+        // (`FLAMINGO_DUMP_RANGE`), or as the first indirect command whose pipeline is named
+        // `FLAMINGO_DUMP_AT` left them.
         #[cfg(feature = "diagnostics")]
-        if kind == MESH && p.name.contains("PedTransformPreSkinD") {
+        if p.name.contains(crate::capture::dump_at()) {
             crate::capture::note_ranges(list);
         }
         // The scratch buffer stays readable as arguments: the next draw of
