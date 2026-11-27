@@ -607,6 +607,7 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
 - 2026-11-27 (this session): **run announced** — the same, plus the frame log's split of the
   memory watch's costs on the frame's own threads (preparing, presenting, submitting), to measure
   what the bridge could take off the frame's critical path. Done 13:39-13:50, no crash.
+- 2026-11-27 (this session): **run announced** — e8f663f, **`VICTORY_BRIDGE=1`** (first game run on the bridge), otherwise as the 13:39 run; 5 min unattended (short runs from now on).
 
 ### Re-scope
 
