@@ -269,7 +269,80 @@ before they start and never overlap (spikes use their own throwaway Wine prefixe
 
 ### S1 results
 
-(pending)
+Done 2026-11-27, `tools/bridge-spike/s1/` (README there: build, run, what each test does). Proton
+Experimental 11.0-20261112, kernel 6.18.65, 16 threads, a throwaway prefix, the game not running.
+The same driver runs twice: as a Windows exe under Proton (the PE half calls the Unix half; **all
+writes are made by PE threads**; a vectored handler counts every exception) and natively (links
+the Unix half directly). uffd opened with `UFFD_USER_MODE_ONLY`; all of `WP_ASYNC`,
+`WP_UNPOPULATED` and `WP_HUGETLBFS_SHMEM` are available and enabled. Window: 60,000 views of
+64 KiB (3.66 GiB) over a 512 MiB memfd, view i at offset (i % 8192) × 64 KiB (aliasing). Numbers
+are medians of three alternating runs started on an idle machine (one Proton run was disturbed by
+other sessions' builds at about 2×; the median drops it).
+
+| At 60,000 views of 64 KiB | Native | Under Proton |
+|---|---|---|
+| mmap of a view (no uffd) / unmap to PROT_NONE, in sequence | 0.72 / 0.87 µs | 0.76 / 0.92 µs |
+| + `UFFDIO_REGISTER(WP)` per view / + `UFFDIO_WRITEPROTECT` per view | +0.49 / +0.28 µs | +0.47 / +0.28 µs |
+| churn at full occupancy, random view unmapped + mapped again: no uffd / registered + armed | 2.23 / 3.27 µs | 2.49 / 3.15 µs |
+| scan of the whole window, nothing written (unpopulated / 150k pages populated) | 1.62 / 1.80 ms | 1.67 / 2.33 ms |
+| scan, 100 pages written | 1.73 ms | 2.10 ms |
+| scan, 1 page written in each of the 60,000 views (56,251 regions) | 4.47 ms | 4.38 ms |
+| scan, all 16 pages of every 10th view (96,000 pages, 6,000 regions) | 4.23 ms | 4.58 ms |
+| first write to an armed populated page / same page writable | 443 / 10 ns | 495 / 12 ns |
+| first write after a fresh map (pool page exists, no PTE): registered+armed / no uffd | 987 / 581 ns | 1210 / 646 ns |
+| private 3.66 GiB, one range registered+armed: scan with nothing written | 1.34 ms | 1.64 ms |
+| Wine's `GetWriteWatch(RESET)` on a 3.66 GiB `MEM_WRITE_WATCH` region: nothing / 100 / 48,000 written | — | 1.50 / 1.71 / 2.66 ms |
+| first write to a page watched by Wine (`MEM_WRITE_WATCH`, after reset) | — | 454 ns |
+
+Answers:
+
+- **It works inside a Proton process**, on memfd `MAP_SHARED` views mapped `MAP_FIXED` over
+  Wine-reserved space and on Wine's private memory (`VirtualAlloc(MEM_COMMIT)`). Writes from PE
+  code (4-6 threads) into armed pages go through with no exception (the vectored handler saw 0 in
+  every run, natively no SIGSEGV), costing one kernel minor fault (~0.45 µs, no signal). One scan
+  returns exactly the written pages at 4 KiB granularity (no page missing, none extra, unpopulated
+  and populated pages alike) and re-arms them: the next scan with no writes returns 0. Reads never
+  count as writes. 6 writers against back-to-back scans for 300 ms (≈3 million writes, 13,000
+  scans): no write lost, none invented. Nothing odd from Wine: no signals, `wineserver` untouched,
+  threads fine; the Proton numbers equal the native ones on a quiet machine.
+- **Registering once over the reserved range and mapping inside it does not work**: the `MAP_FIXED`
+  mmap replaces the VMA and drops the registration (writes to such views are never reported). So
+  each view must be registered (and armed) right after its mmap: +0.75 µs per view (≈+1 µs per
+  unmap+map cycle at full occupancy, because unmapping a registered and armed view costs more).
+  An unmapped view (back to PROT_NONE anon) is unregistered, which is fine.
+- **Aliases are tracked per mapping, not per pool page**: a write through view A is reported at
+  A's addresses only; the alias B of the same memfd offset sees the data but is not reported.
+  Unmap + map again (registered + armed) starts clean, data kept.
+- **`PM_SCAN_CHECK_WPASYNC` is dangerous**: a scan that meets an unregistered VMA fails with EPERM
+  *after* having re-armed the pages it already walked, whose writes are then lost (checked: a write
+  before such a failed scan was not reported by the next scan). Without the flag,
+  `PM_SCAN_WP_MATCHING` silently skips unregistered VMAs.
+- **Scan cost** is a page-table walk proportional to the address range scanned (~0.45 ms per GiB
+  armed, nothing written) plus ~50 ns per region returned; whole-window scans every frame would
+  cost 1.6-4.5 ms.
+- **Private memory**: our registration works, survives `VirtualProtect`, but is **lost** on
+  `MEM_DECOMMIT` + `MEM_COMMIT` (Wine re-mmaps). And Proton's Wine **already implements
+  `MEM_WRITE_WATCH` with its own uffd in async mode** (our `UFFDIO_REGISTER` there gives EBUSY;
+  first write 454 ns, no exception; `GetWriteWatch` costs the same as our scan).
+- Wine loads a builtin DLL's Unix half from beside the exe only with `WINEDLLPATH` naming that
+  directory (also true of the first spike); without it `MemoryWineUnixFuncs` fails (WS2/WS9).
+- Not verified: the cost of today's path (64 KiB guards + vectored handler + `VirtualProtect`)
+  measured the same way; memfd hugepages; `PAGEMAP_SCAN` racing an unmap of the same range from
+  another thread; skipping the per-view arm (on an anonymous reserved range a registered but
+  unarmed range reports every page as written; not checked on memfd views).
+
+**Decides (WS5):** register and arm **per view at map time**, inside the bridge's map batch
+(`UFFDIO_REGISTER(MODE_WP)` + `UFFDIO_WRITEPROTECT` on the view's range right after its mmap,
+~0.75 µs; at today's ~2,100 remap calls per frame ≈ 1.5-2 ms per frame of extra Unix-side work,
+against Wine's 337 µs per map+unmap it replaces). Never register "the window" and rely on it.
+`watch_take(addr, len)` = one `PAGEMAP_SCAN` with `PM_SCAN_WP_MATCHING`, category
+`PAGE_IS_WRITTEN`, **without** `PM_SCAN_CHECK_WPASYNC`, over only the ranges the watch asks about
+(cost scales with the range, not with the window); results at 4 KiB, the journal may coarsen them.
+The bridge must guarantee every mapped view in the window is registered (it is the only one that
+maps there), and must translate written addresses to pool offsets and fan them out to all aliases
+from xmem's page table (the kernel reports only the view written through). For **private memory**
+keep `GetWriteWatch`: under Proton it is already uffd async (same cost, no faults), and our own
+registration would silently drop on Wine's decommit/recommit. No blocker found.
 
 ### S2 results
 
