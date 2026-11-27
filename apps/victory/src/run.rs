@@ -277,6 +277,9 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    // The title's own exit lets the card's work run out first, as the other ends do.
+    #[cfg(windows)]
+    victory_loader::set_exit_hook(victory_hle::modules::lifecycle::drain_card);
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);

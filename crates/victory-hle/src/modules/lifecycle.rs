@@ -527,6 +527,12 @@ pub fn wait_for_previous() {
     }
 }
 
+/// Lets the card's work run out (`victory_gpu::drain`), as [`end`] does: for
+/// the title's own exit (`victory_loader::set_exit_hook`).
+pub fn drain_card() {
+    victory_gpu::drain(DRAIN_DEADLINE);
+}
+
 fn end() {
     // The card's work run out first: a process ended under running lists
     // faulted the card and once hung NVIDIA's driver in its clean-up, with

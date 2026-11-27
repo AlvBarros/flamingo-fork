@@ -78,12 +78,26 @@ static EXITING: AtomicBool = AtomicBool::new(false);
 /// (a thread ended while holding a lock their detach code wants).
 const DETACH_DEADLINE: Duration = Duration::from_secs(5);
 
+/// Run first at process exit ([`set_exit_hook`]).
+static EXIT_HOOK: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// `hook` runs first when the title exits through its CRT's `exit`, while
+/// every thread still runs (the runtime lets the card's work run out there:
+/// a process ended under running lists once hung NVIDIA's driver). Only the
+/// first call counts.
+pub fn set_exit_hook(hook: fn()) {
+    let _ = EXIT_HOOK.set(hook);
+}
+
 /// Process exit (the CRT's `exit`, which titles call), in `ExitProcess`'s
 /// order: the title's exit functions have run; every other thread ends
 /// (title threads and ours); every attached image gets
 /// `DLL_PROCESS_DETACH`, DLLs in reverse initialisation order, then the
 /// exe's TLS callbacks; then the CRT ends the process.
 extern "C" fn detach_all() {
+    if let Some(hook) = EXIT_HOOK.get() {
+        hook();
+    }
     let attached: Vec<_> = images()
         .iter_mut()
         .filter(|m| m.attached)
