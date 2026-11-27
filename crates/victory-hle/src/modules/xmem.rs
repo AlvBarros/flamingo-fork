@@ -1059,35 +1059,57 @@ enum Call {
     Commit = 13,
 }
 
-/// Runs `f`, a system call, and counts it while the streaming log is on.
+/// Runs `f`, a system call, and counts it while the streaming log is on;
+/// in every build into the frame log's totals (`victory_gpu::framelog`:
+/// the Windows calls of remapping).
 fn counted<T>(call: Call, f: impl FnOnce() -> T) -> T {
-    if !super::dstorage::stream_log::on() {
-        return f();
-    }
+    use victory_gpu::framelog::{T as F, add};
     let started = std::time::Instant::now();
     let done = f();
-    MAPPING[call as usize].fetch_add(1, Ordering::Relaxed);
-    MAPPING[call as usize + 1].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    let ns = started.elapsed().as_nanos() as u64;
+    add(F::RemapOsCalls, 1);
+    add(F::RemapOsNs, ns);
+    if super::dstorage::stream_log::on() {
+        MAPPING[call as usize].fetch_add(1, Ordering::Relaxed);
+        MAPPING[call as usize + 1].fetch_add(ns, Ordering::Relaxed);
+    }
     done
 }
 
-/// Counts a mapping call when dropped.
+/// Runs `f`, telling the GPU side of a change of mapping, timed into the
+/// frame log's totals (`victory_gpu::framelog`: what of remapping is the
+/// memory watch's own work).
+fn told(f: impl FnOnce()) {
+    use victory_gpu::framelog::{T, timed};
+    timed(T::RemapNotes, T::RemapNoteNs, f);
+}
+
+/// Counts a mapping call when dropped: in every build into the frame log's
+/// totals (`victory_gpu::framelog`), and into [`MAPPING`] while the
+/// streaming log is on.
 struct Costed {
     started: std::time::Instant,
     /// `None`: a copy of mappings.
     pages: Option<usize>,
     waited: u64,
+    log: bool,
 }
 
 impl Costed {
     fn begin(pages: Option<usize>) -> Option<Costed> {
-        super::dstorage::stream_log::on().then(|| Costed { started: std::time::Instant::now(), pages, waited: 0 })
+        let log = super::dstorage::stream_log::on();
+        Some(Costed { started: std::time::Instant::now(), pages, waited: 0, log })
     }
 }
 
 impl Drop for Costed {
     fn drop(&mut self) {
         let ns = self.started.elapsed().as_nanos() as u64;
+        victory_gpu::framelog::add(victory_gpu::framelog::T::XmemCalls, 1);
+        victory_gpu::framelog::add(victory_gpu::framelog::T::XmemNs, ns);
+        if !self.log {
+            return;
+        }
         let Some(pages) = self.pages else {
             MAPPING[5].fetch_add(1, Ordering::Relaxed);
             MAPPING[6].fetch_add(ns, Ordering::Relaxed);
@@ -1765,7 +1787,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 if let Some((size, slice)) = physical.views.remove(&op.at) {
                     shown_mut().forget(op.at, size, &slice);
                 }
-                victory_gpu::title_memory_unmapping(op.at, PAGE);
+                told(|| victory_gpu::title_memory_unmapping(op.at, PAGE));
                 physical.holes.remove(&op.at);
                 if unlazy(op.at) {
                     // Only in our books: its own placeholder is there.
@@ -1803,8 +1825,8 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
             Some(slice) if done => {
                 // As in `map`.
                 shown_mut().note(op.at, PAGE, &slice);
-                victory_gpu::title_memory_remapped(op.at, PAGE);
-                victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64);
+                told(|| victory_gpu::title_memory_remapped(op.at, PAGE));
+                told(|| victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64));
                 physical.views.insert(op.at, (PAGE, slice));
             }
             None if op.had && done => {
@@ -1953,9 +1975,9 @@ fn map_as(physical: &mut Physical, base: usize, len: usize, slice: Slice, quiet:
     // the time the copies of them go.
     shown_mut().note(base, len, &slice);
     // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
+    told(|| victory_gpu::title_memory_remapped(base, len));
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
+    told(|| victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64));
     physical.views.insert(base, (len, slice));
     true
 }
@@ -2111,9 +2133,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         shown_mut().forget(at, size, &slice);
         if at < base || at + size > end {
             // Parts of it stay, and are mapped again below.
-            victory_gpu::title_memory_splitting(at, size);
+            told(|| victory_gpu::title_memory_splitting(at, size));
         }
-        victory_gpu::title_memory_unmapping(at, size);
+        told(|| victory_gpu::title_memory_unmapping(at, size));
         if unlazy(at) {
             // A view only in our books ([`map_lazy`]): no host view to
             // unmap; its own placeholder is there, and what stays of it
@@ -2475,8 +2497,8 @@ fn map_lazy(physical: &mut Physical, base: usize, len: usize, slice: Slice, who:
         }
     }
     shown_mut().note(base, len, &slice);
-    victory_gpu::title_memory_remapped(base, len);
-    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
+    told(|| victory_gpu::title_memory_remapped(base, len));
+    told(|| victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64));
     physical.views.insert(base, (len, slice));
     if let Some(who) = who {
         count(Soft::Noted, 1);
@@ -2640,7 +2662,7 @@ fn materialize_for(at: usize, len: usize, touch: Touch) -> bool {
         // Read-write, and there: the title writes through it from now on
         // with no fault. What the GPU side guarded of it in its books, and
         // the other views of its pages with it, counts as written.
-        victory_gpu::title_memory_made_real(base, size);
+        told(|| victory_gpu::title_memory_made_real(base, size));
         count(Soft::Real, 1);
         match touch {
             Touch::Fault(code) => {

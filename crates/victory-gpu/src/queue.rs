@@ -591,6 +591,16 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    // The frame log's (`crate::framelog`): all submit calls, and the
+    // presenting thread's own.
+    let started = std::time::Instant::now();
+    execute_now(this, count, lists);
+    let us = started.elapsed().as_micros() as u64;
+    crate::framelog::add(crate::framelog::T::ExecuteUs, us);
+    crate::framelog::here(crate::framelog::H::ExecuteUs, us);
+}
+
+fn execute_now(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
@@ -921,6 +931,21 @@ extern "system" fn present(
     this: This,
     planes: u32,
     plane_parameters: *const Plane,
+    parameters: *const u8,
+) -> HRESULT {
+    // The frame log's (`crate::framelog`): the present call, then the
+    // frame's end.
+    let presenting = std::time::Instant::now();
+    let hr = present_now(this, planes, plane_parameters, parameters);
+    crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
+    crate::framelog::frame();
+    hr
+}
+
+fn present_now(
+    this: This,
+    planes: u32,
+    plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
     #[cfg(not(windows))]
@@ -1065,12 +1090,15 @@ extern "system" fn present(
                     (over_res, over_tex, over_state)
                 })
             });
+        let showing = std::time::Instant::now();
         show_planes(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
             Shown { frame, resource: resource as usize },
         );
+        let us = showing.elapsed().as_micros() as u64;
+        crate::framelog::add(crate::framelog::T::PresentShowUs, us);
         crate::resource::host_transition(resource, state);
         if let Some((over_res, _, over_state)) = overlay {
             crate::resource::host_transition(over_res, over_state);

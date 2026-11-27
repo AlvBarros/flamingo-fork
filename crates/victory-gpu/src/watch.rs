@@ -170,19 +170,26 @@ fn journal_mut() -> std::sync::RwLockWriteGuard<'static, Journal> {
 #[cfg(feature = "diagnostics")]
 static WAITS: [[std::sync::atomic::AtomicU64; 2]; 4] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 4];
 
-#[cfg(feature = "diagnostics")]
+/// `f`, a wait for a lock found held (`what` as in [`WAITS`]), counted; in
+/// every build into the frame log's totals (`crate::framelog`).
 fn waited<T>(what: usize, f: impl FnOnce() -> T) -> T {
-    use std::sync::atomic::Ordering::Relaxed;
+    use crate::framelog::T as F;
     let began = std::time::Instant::now();
     let got = f();
-    WAITS[what][0].fetch_add(1, Relaxed);
-    WAITS[what][1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+    let ns = began.elapsed().as_nanos() as u64;
+    if what == 3 {
+        crate::framelog::add(F::GuardWaits, 1);
+        crate::framelog::add(F::GuardWaitNs, ns);
+    } else {
+        crate::framelog::add(F::WatchLockWaitNs, ns);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        WAITS[what][0].fetch_add(1, Relaxed);
+        WAITS[what][1].fetch_add(ns, Relaxed);
+    }
     got
-}
-
-#[cfg(not(feature = "diagnostics"))]
-fn waited<T>(_: usize, f: impl FnOnce() -> T) -> T {
-    f()
 }
 
 /// [`WAITS`], taken, for the log: per frame.
@@ -250,6 +257,48 @@ impl Drop for Asking {
     }
 }
 
+/// The memory watch's protection changes and region queries, counted and
+/// timed into the frame log's totals (`crate::framelog`, lines with
+/// `VICTORY_FRAME_LOG=1`); the functions below import these in place of
+/// windows-sys' own. Under Wine each is a call into the address-space lock.
+#[allow(non_snake_case)]
+mod sys {
+    use crate::framelog::{T, timed};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_PROTECTION_FLAGS};
+    use windows_sys::core::BOOL;
+
+    /// `VirtualProtect`, counted.
+    ///
+    /// # Safety
+    /// As `VirtualProtect`'s.
+    pub(super) unsafe fn VirtualProtect(
+        at: *const core::ffi::c_void,
+        len: usize,
+        new: PAGE_PROTECTION_FLAGS,
+        old: *mut PAGE_PROTECTION_FLAGS,
+    ) -> BOOL {
+        // SAFETY: the caller's.
+        timed(T::ProtectCalls, T::ProtectNs, || unsafe {
+            windows_sys::Win32::System::Memory::VirtualProtect(at, len, new, old)
+        })
+    }
+
+    /// `VirtualQuery`, counted.
+    ///
+    /// # Safety
+    /// As `VirtualQuery`'s.
+    pub(super) unsafe fn VirtualQuery(
+        at: *const core::ffi::c_void,
+        info: *mut MEMORY_BASIC_INFORMATION,
+        len: usize,
+    ) -> usize {
+        // SAFETY: the caller's.
+        timed(T::QueryCalls, T::QueryNs, || unsafe {
+            windows_sys::Win32::System::Memory::VirtualQuery(at, info, len)
+        })
+    }
+}
+
 thread_local! {
     /// Room for the kernel's answer.
     static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -268,7 +317,6 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
             found.resize(count, 0);
         }
         let mut granularity = 0;
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
@@ -281,6 +329,14 @@ fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
                 &mut granularity,
             )
         } != 0;
+        {
+            // The frame log's (`crate::framelog`), in every build.
+            use crate::framelog::{T, add};
+            add(T::WatchAsks, 1);
+            add(T::WatchNs, started.elapsed().as_nanos() as u64);
+            add(T::WatchBytes, ((last - first) * PAGE) as u64);
+            add(T::WatchRefused, u64::from(failed));
+        }
         #[cfg(feature = "diagnostics")]
         {
             tally(10, u64::from(failed));
@@ -1112,7 +1168,8 @@ static FAULTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::A
 /// protection could not be changed).
 fn open_unlocked(block: usize) -> bool {
     use std::sync::atomic::Ordering::{Relaxed, SeqCst};
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    use self::sys::VirtualProtect;
     #[cfg(feature = "diagnostics")]
     let began = std::time::Instant::now();
     if OPENING.swap_on(block) {
@@ -2098,8 +2155,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// `VICTORY_GUARD_HOLES=0` looks at the first address only, as before.
 fn is_view(start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION,
     };
+    use self::sys::VirtualQuery;
     static HOLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
     let mut at = start;
@@ -2191,7 +2249,8 @@ fn cover(g: &mut Guards, from: usize, to: usize) -> bool {
 /// One that is clean stays so: had the page been written since its copies
 /// took it, [`open`] would have opened it. Whether it is read-only now.
 fn protect_alias(g: &mut Guards, block: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    use self::sys::VirtualProtect;
     g.alias(block);
     // (After its `ALIASED` bit: a fault that did not see that one is seen
     // here.) Being opened: writable, whatever the notes say.
@@ -2250,7 +2309,8 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    use self::sys::VirtualProtect;
     let set = |from: usize, to: usize| {
         let mut old = 0;
         #[cfg(feature = "diagnostics")]
@@ -2325,8 +2385,9 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION,
     };
+    use self::sys::VirtualQuery;
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
@@ -2379,7 +2440,8 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
 
 /// Gives write access back to `blocks`, guarded ones.
 fn unguard(g: &mut Guards, blocks: &[usize]) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE};
+    use self::sys::VirtualProtect;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // All of them before the first can be written: a write through one is a
@@ -2622,10 +2684,16 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(
+    #[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>,
+    std::time::Instant,
+);
 
 impl Drop for Remapping {
     fn drop(&mut self) {
+        // From asking for the lock until it is let go (the frame log's,
+        // `crate::framelog`).
+        crate::framelog::add(crate::framelog::T::RemapUs, self.1.elapsed().as_micros() as u64);
         // The change is done: what is there now may be guarded.
         if CHANGING.replace((false, false)).1 {
             guards().changing.clear();
@@ -2738,8 +2806,9 @@ fn came_back(at: usize, write: bool) -> bool {
 /// Whether `at` is in a committed page of a view that can be read.
 fn readable_view(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE,
     };
+    use self::sys::VirtualQuery;
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
@@ -2779,10 +2848,13 @@ pub fn title_memory_remapping() -> Remapping {
             tracing::info!(met, "accesses of title threads that waited for a change of mapping");
         }
     }
+    let asked = std::time::Instant::now();
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    crate::framelog::add(crate::framelog::T::Remaps, 1);
+    crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
     CHANGES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     CHANGING.set((true, false));
-    Remapping(changing)
+    Remapping(changing, asked)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -2885,7 +2957,8 @@ pub fn title_memory_freed(at: usize, len: usize) {
 
 /// The end of the allocation at `at`, if `inside` lies in it; else `at`.
 fn allocation_end(at: usize, inside: usize) -> usize {
-    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION};
+    use self::sys::VirtualQuery;
     let ask = |address: usize| {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -3111,6 +3184,7 @@ pub(crate) fn install() {
         }
         if unlocked() && PROTECTED.any(block, block + 1) {
             if open_unlocked(block) {
+                crate::framelog::add(crate::framelog::T::GuardFaults, 1);
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -3155,6 +3229,7 @@ pub(crate) fn install() {
             if opened != 0 {
                 g.opened(block);
                 drop(g);
+                crate::framelog::add(crate::framelog::T::GuardFaults, 1);
                 #[cfg(feature = "diagnostics")]
                 {
                     crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -3188,8 +3263,9 @@ pub(crate) fn install() {
 /// Whether `at` is committed read-write memory now.
 fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE,
     };
+    use self::sys::VirtualQuery;
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.

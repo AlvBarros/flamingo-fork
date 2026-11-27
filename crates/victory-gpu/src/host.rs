@@ -635,15 +635,23 @@ pub(crate) fn log_removal_context() {
 
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
-/// detiling), then waiting for the GPU.
-static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+/// detiling), then waiting for the GPU. Also the frame log's
+/// (`crate::framelog`: submissions, preparing, waiting for the card).
+static SUBMISSION_US: [crate::framelog::Counter; 2] = [
+    crate::framelog::Counter::counting(
+        crate::framelog::T::PrepareUs,
+        crate::framelog::T::Submissions,
+    ),
+    crate::framelog::Counter::to(crate::framelog::T::CardWaitUs),
+];
 
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
-/// frame-rate line.
-static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
-    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+/// frame-rate line. Also the frame log's (`crate::framelog`).
+static COPY_BACK: [crate::framelog::Counter; 2] = [
+    crate::framelog::Counter::to(crate::framelog::T::CopyBackUs),
+    crate::framelog::Counter::to(crate::framelog::T::CopyBackBytes),
+];
 
 /// The card's clock, for the frame line of every run, in microseconds since
 /// the last one: how long the card had nothing of ours queued; how much of
@@ -654,8 +662,13 @@ static COPY_BACK: [std::sync::atomic::AtomicU64; 2] =
 /// Every send of lists to the queue is followed by a signal on a fence of
 /// the clock's own ([`Host::card_sent`]). A thread of the clock waits for
 /// the newest signal and notes the moment the card reached it with nothing
-/// newer sent; the next send ends that idle stretch.
-static CARD_CLOCK_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// newer sent; the next send ends that idle stretch. The first two are
+/// also the frame log's (`crate::framelog`).
+static CARD_CLOCK_US: [crate::framelog::Counter; 3] = [
+    crate::framelog::Counter::to(crate::framelog::T::CardIdleUs),
+    crate::framelog::Counter::to(crate::framelog::T::CardIdleBehindUs),
+    crate::framelog::Counter::new(),
+];
 
 /// Of the thread that holds the submission lock: the microseconds it has
 /// worked so far (preparing, copying back; not its waits for the card), and
@@ -744,11 +757,13 @@ fn card_clock_line(frames: f64, ms: f64) {
 
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
-pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
+/// The copies are also the frame log's (`crate::framelog`; its textures are
+/// `crate::texture::REFRESH_WAITS`).
+pub(crate) static PREPARING: [crate::framelog::Counter; 4] = [
+    crate::framelog::Counter::to(crate::framelog::T::CopyUs),
+    crate::framelog::Counter::to(crate::framelog::T::CopyBytes),
+    crate::framelog::Counter::new(),
+    crate::framelog::Counter::new(),
 ];
 
 /// Host buffers made since the start, as (count, bytes): in the upload heap

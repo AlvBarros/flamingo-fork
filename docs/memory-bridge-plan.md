@@ -611,3 +611,107 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
   First reading: write tracking (guards + protections + askings, ~50 ms a frame summed over
   threads at the median) is what is left of Wine's memory costs, i.e. **WS5 still pays; WS3 (xmem
   remapping) likely does not**. To confirm per long frame with the WS8 frame log before starting.
+
+### WS8 results (foxhound base)
+
+Done 2026-11-27 on `memory-bridge-foxhound-ws8`. The per-frame log of the Flamingo-based branch
+(`linux-on-new-upstream`: `crates/victory-gpu/src/framelog.rs` and xmem's `timed`) is ported to
+this base as `crates/victory-gpu/src/framelog.rs`, with this base's hook sites.
+
+**Switch.** `VICTORY_FRAME_LOG=1` (any value but `0`) prints the lines; **off by default in every
+build**, diagnostics included (the old branch had it on in diagnostics builds). The counters are
+plain relaxed atomic adds (plus a clock read around the timed calls) in every build, switch on or
+off; with the switch off nothing else changes. Every counter runs from the start and is never reset;
+at the end of each present call the totals are read and their differences are that frame's.
+
+**Lines** (target `victory_gpu::framelog`, every 5 s):
+
+    frame times: <n> frames in <s> s: shortest <ms> ms, median <ms>, longest <ms>; <k> long (over <ms> ms, the usual frame of the last 64 being <ms>); each: <ms> <ms> ...
+    usual frame (the mean of <n> not long): <make-up>
+    long frame <number> at <s> s: <make-up>          (one line per long frame, at most 32 a reading)
+    long frames: <k> more in this reading are not listed
+
+A frame is long when it is over 1.5 times the usual frame and at least 40 ms over it (the usual
+frame: the median of the last 64). `<make-up>` is, in one line, sections split by ` | `:
+
+    <ms> ms | render thread: ran <ms> ms (user <ms>, kernel <ms>); in the present call <ms> (copy and show <ms>), in submit calls <ms>, paced <ms>
+    | submissions: <n>, preparing <ms> ms, waiting for the card <ms>; copies <ms> ms <MB> MB; copy-back <ms> ms <MB> MB
+    | card: idle <ms> ms (<ms> behind us) | all submit calls <ms> ms
+    | textures: refresh <ms> ms (<ms> waiting for another thread's refresh, <ms> asking the watch, <ms> waiting for memory to hold still), <n> uploads
+    | remapping: <n> calls <ms> ms (<ms> waiting for readers)
+    | xmem: <n> mapping calls <ms> ms; Windows calls <n> <ms> ms; the GPU side told <n> <ms> ms
+    | memory watch, all threads: <n> write-watch askings (<n> refused) <ms> ms over <MB> MB; <n> protection changes <ms> ms; <n> region queries <ms> ms; waits for the guards <n> <ms> ms, for its other locks <ms> ms; <n> guard faults
+    | pipelines: <ms> ms waited | disk: <n> reads <MB> MB <ms> worker ms | pacing, all threads <ms> ms
+    | process: <ms> user <ms> kernel ms, <n> page faults | <n> draws | <MB> MB free
+
+"Render thread" columns are the presenting thread's own; all others are summed over threads (so
+they can exceed the frame's length).
+
+**Where each column is counted** (all through `framelog::add`/`timed`, or `framelog::Counter`,
+which stands in for the `AtomicU64` of an existing frame-rate-line counter and adds to a frame-log
+total as well, so the sites stayed as they were):
+
+| Column | Counted in |
+|---|---|
+| present call; copy and show; frame end | `queue.rs`: `present` (wraps `present_now`), `show_planes` call in `present_now`; `framelog::frame` |
+| submit calls (all, render thread's) | `queue.rs`: `execute` (wraps `execute_now`) |
+| paced | `frame.rs`: `wait` |
+| submissions, preparing, waiting for the card | `host.rs`: `SUBMISSION_US` (Counter; adds at the submission sites as before) |
+| copies ms/MB; copy-back ms/MB | `host.rs`: `PREPARING[0..2]`, `COPY_BACK` (Counters) |
+| card idle (behind us) | `host.rs`: `CARD_CLOCK_US[0..2]` (Counter), `Host::card_sent` |
+| texture refresh and its waits | `texture.rs`: `REFRESH_WAITS` (Counter; `waited`, `refresh_now`) |
+| uploads | `texture.rs`: `upload_from`, `finish_refresh` |
+| pipelines waited | `pipeline/make.rs`: `wait` |
+| remapping calls, ms, wait for readers | `watch.rs`: `title_memory_remapping`, `Remapping::drop` |
+| xmem mapping calls | `xmem.rs`: `Costed` (now always made): `map_pages` (`XMemMapPhysicalPages`), `map_alias`, `map_aliases`, `scatter` |
+| Windows calls | `xmem.rs`: `counted` (unmap, split/coalesce, map, commit; every such call of xmem's, including views made real after a fault with `VICTORY_SOFT_VIEWS` and commits) |
+| the GPU side told | `xmem.rs`: `told` around `title_memory_remapped/_view/_unmapping/_splitting/_made_real` |
+| write-watch askings (refused, MB, ms) | `watch.rs`: `kernel_written` (the `GetWriteWatch` call) |
+| protection changes; region queries | `watch.rs`: `sys::VirtualProtect`/`sys::VirtualQuery`, imported in place of windows-sys' by every non-test function of watch.rs (`open_unlocked`, `protect_alias`, `protect_here`, `unguard`; `is_view`, `uncommitted_end`, `readable_view`, the allocation-end query, `writable`) |
+| waits for the guards; for its other locks | `watch.rs`: `waited` (now in every build): `what == 3` is the guards' lock found held (the fault handler's waits among them), the rest the ranges held and the journal |
+| guard faults | `watch.rs`: `install`'s `on_write`, both places a write fault opens a guarded block |
+| disk | `dstorage.rs`: `Lanes::count` |
+| process, page faults, draws, free MB, render thread ran | sampled at each present (`framelog::sample`) |
+
+**Not on this base, left out:** the card's own clock by kind of list (no `cardmeter.rs`); the
+looks at slow cores (no `spread.rs`; `cores.rs` differs); the submit thread's own time
+(`VICTORY_ASYNC_SUBMIT`'s worker here is `queue/behind.rs`, not hooked); recording calls (here
+`copystat`, diagnostics only); pipelines made/loaded and staging made/reused (no
+`frame_log_counts`/`SPARE_STATS`); the hot set and `VICTORY_VERIFY` counts; the present's
+"lines and settling" split (this base's present is laid out differently: the whole call and its
+copy-and-show only).
+
+**Reading them.** `scripts/linux/ab_runs.py <log A> [<log B>] [from s] [to s] [min draws]` now
+reads all of the make-up's columns. It prints the frame times of the stretch (mean, median, p90,
+p99, max, share over 250 ms and 1 s, long frames, the share of the time spent in long frames) and,
+per column, the mean in usual frames (weighted by the frames each line stands for), the median and
+sum over the long frames listed, and the long frames' share of the column's total; with two logs,
+how B differs from A. For the bridge: compare the memory columns (remapping, xmem, memory watch)
+between long and usual frames; a column whose long-frame median is small against the frame says
+the bridge would not shorten those frames.
+
+**Tests.** Eight new unit tests in `framelog` (no GPU): line form and the usual/long split,
+the long-frame limit, more long frames than listed, a reading with only long frames, the usual
+frame's median over the last 64, a frame as the difference of two readings (negative after a
+correction, free memory not a difference, thread times dropped when another thread presented),
+the memory columns in the line, totals/`Counter`/`timed` arithmetic. `scripts/linux/test.sh`
+(`FORK_FEATURES=""`, under Proton, while another session ran the game on the same GPU), lib tests,
+one thread, against the base b3fc71c built the same way:
+- `victory-gpu`: four tests kill the test process on both (skipped:
+  `host::tests::warp_adapter_accepts_only_software`, `indirect::tests::card_runs_wide_indirect_dispatches`,
+  `indirect::tests::warp_a_group_charges_its_records_in_lane_order`,
+  `indirect::tests::warp_a_record_that_does_not_fit_may_take_nothing`). Base: 408 passed, 4 failed
+  (`watch::many_askers_tests::{bits_and_holes_with_faults_that_take_no_lock,
+  holes_are_known_until_the_runtime_tells, no_mapping_is_lost_between_askers}`,
+  `watch::tests::what_is_left_alone_is_no_known_hole`). With WS8: 413 passed (the 8 new ones
+  among them), the same 4 failed, and 3 more in the full run
+  (`descriptor::host::tests::views_are_made_beside_the_heap_and_copied_in`,
+  `indirect::tests::host_list_budget_starts_empty_at_each_submission`,
+  `pipeline::library::tests::a_rejected_blob_gives_an_empty_library`), which fail the same way
+  on the base when run alone (twice each), so they depend on the machine's state, not on this change.
+- `victory-hle`: 169 passed, 2 failed on both (`modules::net::tests::only_loopback_is_reachable`,
+  `modules::xgamesave::tests::a_kept_blob_past_the_link_limit_is_copied`).
+- `FORK_FEATURES=diagnostics scripts/linux/build.sh` builds; `cargo xtask policy` passes; no new
+  clippy warnings in the touched files; `framelog.rs` is rustfmt-clean (the tree as a whole is not).
+- Not verified: the lines in a game run (no game run by this workstream; the coordinator owns
+  them). `ab_runs.py` was checked against lines printed by the unit test's own output.

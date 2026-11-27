@@ -436,7 +436,12 @@ fn exact_unlocked() -> bool {
 /// submitting thread is not running while it lasts (run 93: 240-310 ms of
 /// its own time a frame beside 1,100-1,800 ms of "textures"): it waits.
 /// These say for what.
-pub(crate) static REFRESH_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static REFRESH_WAITS: [crate::framelog::Counter; 4] = [
+    crate::framelog::Counter::to(crate::framelog::T::RefreshOtherUs),
+    crate::framelog::Counter::to(crate::framelog::T::RefreshAskUs),
+    crate::framelog::Counter::to(crate::framelog::T::RefreshStillUs),
+    crate::framelog::Counter::to(crate::framelog::T::RefreshUs),
+];
 
 /// `f`'s result, its time added to [`REFRESH_WAITS`]' place `slot`.
 fn waited<T>(slot: usize, f: impl FnOnce() -> T) -> T {
@@ -886,6 +891,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::TexUploads, 1);
+    crate::framelog::add(crate::framelog::T::Uploads, 1);
     if no_wait() && fill_unlocked() {
         let there = match picking {
             Some(there) if there != u64::MAX => there,
@@ -1004,6 +1010,7 @@ impl PreludeUpload {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexUploads, 1);
+        crate::framelog::add(crate::framelog::T::Uploads, 1);
         // A host copy that took the place of one with fewer levels: the slots
         // that show that one are made again once this upload has run.
         if self.staging.first == self.staging.level0 && self.copy.grown.swap(false, Relaxed) {
