@@ -84,7 +84,7 @@ fn build() -> [u8; 32] {
     // Flamingo: switches this file reads that change a translation (the
     // stand-ins, the listed wave forms), with their values; the shader
     // crate's fingerprint holds only the switches it reads itself.
-    for name in ["VICTORY_AMBIENT_STUB", "VICTORY_SHADOWMASK_STUB", "VICTORY_WAVE_WIDE_ONLY", "VICTORY_FIRSTLANE_OWN_ONLY"] {
+    for name in ["VICTORY_AMBIENT_STUB", "VICTORY_SHADOWMASK_STUB", "VICTORY_WAVE_WIDE_ONLY", "VICTORY_FIRSTLANE_OWN_ONLY", "VICTORY_WAVE_PAIRS_OFF"] {
         h.update(name.as_bytes());
         h.update(b"=");
         if let Some(value) = std::env::var_os(name) {
@@ -100,12 +100,15 @@ fn build() -> [u8; 32] {
 /// translated into the cache unless it is there already. `Ok(true)`: it
 /// was translated now. Needs [`use_shader_cache`] and the same host facts
 /// the run will have (`victory_shader::emit::translation_fingerprint`).
+/// The forms listed by hash ([`translate_listed`]) as a run takes them: the
+/// entry is filed under the same key a run looks up, and the warm-up used to
+/// translate without them, so a run served after a warm-up never had them.
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
     let ran = AtomicBool::new(false);
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        translate_listed(c)
     };
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
@@ -119,7 +122,11 @@ fn translate_listed(c: &[u8]) -> Result<HostShader, String> {
     victory_shader::emit::with_wave_wide(listed(&WAVE_WIDE, "VICTORY_WAVE_WIDE_ONLY", &WAVE_WIDE_DEFAULT, &hash), || {
         victory_shader::emit::with_firstlane_own(
             listed(&FIRSTLANE_OWN, "VICTORY_FIRSTLANE_OWN_ONLY", &FIRSTLANE_OWN_DEFAULT, &hash),
-            || victory_shader::emit::translate(c),
+            || {
+                victory_shader::emit::with_pairs_off(listed(&PAIRS_OFF, "VICTORY_WAVE_PAIRS_OFF", &[], &hash), || {
+                    victory_shader::emit::translate(c)
+                })
+            },
         )
     })
     .map_err(|e| e.to_string())
@@ -235,6 +242,16 @@ const FIRSTLANE_OWN_DEFAULT: [&str; 6] = [
     "322ed4ad832bdea6",
     "d441b097704ab616",
 ];
+
+/// Linux fork: the containers that do not take the paired form of a console
+/// wave64 program (`victory_shader::emit::with_pairs_off`):
+/// `VICTORY_WAVE_PAIRS_OFF=<hash>,...`, none by default. The paired form cost
+/// the card ~80 ms a frame on an RTX 4070 in the opening cutscene (all of it
+/// off, `VICTORY_WAVE_PAIRS=0`: the card's time 200 -> 117 ms a frame), most of
+/// it in a few programs (`CS_GenerateShadowMasks_HairOnly`, 107-285 ms a
+/// dispatch timed alone); a listed program takes the next form that translates
+/// it, which may be approximate.
+static PAIRS_OFF: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Whether `hash` (a container's, in hex) is on the list `env` names (hashes
 /// separated by commas, `none` for none), or on `default` without it.

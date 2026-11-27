@@ -652,7 +652,25 @@ fn pairs_on() -> bool {
     if let Some(on) = TEST_PAIRS.get() {
         return on;
     }
-    std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0")
+    !PAIRS_OFF_HERE.get() && std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0")
+}
+
+thread_local! {
+    /// [`with_pairs_off`]'s choice, for this thread's translations.
+    static PAIRS_OFF_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the paired form turned off for it, as
+/// `VICTORY_WAVE_PAIRS=0` turns it off for all: for programs the paired form
+/// makes too slow to keep (each thread runs both of its lanes and the whole
+/// wave takes every branch some lane takes). Such a program takes the next form
+/// that translates it, which may be approximate (each half-wave its own
+/// results).
+pub fn with_pairs_off<R>(off: bool, f: impl FnOnce() -> R) -> R {
+    let before = PAIRS_OFF_HERE.replace(off);
+    let out = f();
+    PAIRS_OFF_HERE.set(before);
+    out
 }
 
 #[cfg(test)]
