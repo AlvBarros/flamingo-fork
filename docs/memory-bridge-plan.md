@@ -199,7 +199,31 @@ off `main`; nothing outside the files a workstream owns changes without the WS0 
 keeps `VICTORY_BRIDGE=0` behaving exactly as before (tests run both ways); runs on the game are
 announced and never overlap (one Wine prefix).
 
-## 8. Risks
+## 8. Settings to measure again (WS8 owns this)
+
+`scripts/linux/play.env` holds the measured best set for this base under Proton (frame median 58 ms,
+mean 193 ms in the cutscene stretch). Several of its values were chosen *against Wine's memory
+costs*; once the bridge works the balance moves, so each is re-measured with `VICTORY_BRIDGE=1`
+(A/B against the same settings with the bridge off, same unattended stretch):
+
+| Setting (now) | Why it may change with the bridge |
+|---|---|
+| `VICTORY_VIEW_GUARD=0` | the bridge's write tracking replaces the guards on views: the switch may stop mattering, or `=1` may be right again |
+| `VICTORY_MAP_THREADS=1` | one mapping thread because Wine's memory lock serialises mapping; natively, `auto` (several) may win |
+| `VICTORY_TEXTURE_NO_WAIT=1` | the stalls it avoids came from slow copies at streaming; if they go, waiting (`=0`) may cost little and remove texture pop-in |
+| `VICTORY_THIN_THREADS=8`, `UNDER_THREADS=6`, `LAND_THREADS=4` | sized while threads queued on Wine's lock |
+| `VICTORY_CARD_BUFFERS_MB=1536`, `VICTORY_INDIRECT_WINDOW=1`, `VICTORY_RELAY=2` | how much is copied to the card against read from title memory |
+
+Also not yet measured on this base at all (clear wins on the Flamingo base, same switches exist
+here): `VICTORY_LATE_WAIT=2` (Flamingo: median -37%), `VICTORY_CARD_BUFFERS_MIN_KB=64` (with
+1536 MB, Flamingo: -25%; this base has `VICTORY_CARD_BUFFERS_MIN_MB=1`), `VICTORY_SHADER_OPT=0`.
+Measure them once without the bridge first (baseline), so their gain is not mixed into the
+bridge's.
+
+A setting becomes the default only after an A/B on drawing frames shows it better (and no crash,
+no new dropped draws); the measurement goes into the comment above it in `play.env`.
+
+## 9. Risks
 
 - **Wine assumptions inside the window** (S2): if Wine reads or protects pages there behind our
   back (e.g. on `NtReadVirtualMemory` from another thread, or exception handling), results are wrong.
