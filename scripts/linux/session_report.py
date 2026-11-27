@@ -95,7 +95,7 @@ def mango(session, notes):
     """MangoHud's recording (every frame's time), if there is one."""
     import glob, os
     files = sorted(glob.glob(f"{session}/*.csv"))
-    files = [f for f in files if not f.endswith("/gpu.csv")]
+    files = [f for f in files if not f.endswith("/gpu.csv") and not f.endswith("_summary.csv")]
     if not files:
         print("\nMangoHud: no recording (not installed, FORK_MANGOHUD=0, or the session ended before it wrote)")
         return
@@ -136,7 +136,11 @@ def main():
     frames, longs, bridge, crashes = read_log(log)
     notes = read_notes(f"{session}/notes.txt")
     print("\n===== session report =====")
-    print("memory bridge:", bridge[0].split("  ")[-1] if bridge else "not asked (VICTORY_BRIDGE unset or 0)")
+    loaded = [b for b in bridge if "memory bridge on" in b or "not available" in b]
+    if loaded:
+        print("memory bridge:", "ON" if "memory bridge on" in loaded[0] else "asked but NOT available (see the log)")
+    else:
+        print("memory bridge:", "off (VICTORY_BRIDGE unset or 0)")
     print("crashes:", len(crashes) and crashes[0] or "none")
     if not frames:
         print("no frame-log lines: is VICTORY_FRAME_LOG=1 set (play.local.env)?")
