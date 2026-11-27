@@ -289,6 +289,13 @@ crate). What is fixed for everyone else:
 - Tests: 19 in the crate (the map; the marshalling against a fake Unix half: batch splitting,
   refusals, map kept in step, version check, missing features; the drop-ins passing other memory
   through, Windows only). Natively and under Proton.
+- Whole suite under Proton (`scripts/linux/test.sh`), `VICTORY_BRIDGE=0` and `=1`, against the
+  base without WS0 (9d6f4df, run twice): the base fails the same 12 tests every time (7 in
+  `victory-gpu` incl. 3 in `watch`, 2 in `victory-hle`, 2 in `victory-shader`, the loader's probe
+  fixture, xtask's policy test under Wine); with WS0 both ways fail those 12 and nothing else
+  except one timing-sensitive test per run (`other_memory_at_a_guarded_address_keeps_its_protection`,
+  `views_off_their_elements_get_a_copy_of_their_bytes`), which pass 12/12 alone both ways (the
+  full runs shared the machine with the four spikes). Pre-existing failures are not WS0's to fix.
 - Found on the way, fixed in a separate commit (9d6f4df): two stale test call sites in
   `victory-gpu` (`descriptor.rs`) and `victory-shader` (`valu_tests.rs`) stopped the suite from
   compiling on this base. Not fixed: `scripts/linux/build.sh` (and so `test.sh`) defaults to the
