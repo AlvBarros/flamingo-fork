@@ -277,7 +277,47 @@ before they start and never overlap (spikes use their own throwaway Wine prefixe
 
 ### S3 results
 
-(pending)
+2026-11-27. Setup: RTX 4070, driver 620.73.04, Proton Experimental 11.0-20261112, vkd3d-proton
+3.2.0 (`2576c0b4`). Code, how to run it and the full output are in `tools/bridge-spike/s3/`.
+Every case checks the result through a second view of the same memfd pages: the GPU reads bytes
+the CPU wrote, the CPU sees bytes the GPU wrote, and this is done in two rounds.
+
+| Case | Result |
+|---|---|
+| Native: import of anonymous memory, memfd `MAP_SHARED`, or a memfd alias placed with `MAP_FIXED` in a `PROT_NONE` range | OK. `minImportedHostPointerAlignment` is 4096. Offered types `0xc`: host-visible coherent, and the same cached; no device-local type |
+| Proton, winevulkan: import of a bridge view in a Wine-reserved window, of an alias of one, and of Wine-committed memory | OK, same types. winevulkan (`win32u/vulkan.c`) passes the host pointer straight to the driver in a 64-bit process and never asks Wine's view list |
+| Imported view unmapped by the bridge after import (natively and under Proton) | The GPU keeps the pool's pages (they are pinned) and they stay coherent through the other views. The heap holds the pages it was given, not the address |
+| Import cost, 256 MiB, pages never touched / touched | memfd 52-67 / 7-13 ms; anonymous or Wine memory 22-30 / 4-6 ms |
+| vkd3d-proton `OpenExistingHeapFromAddress` on a bridge view | **E_INVALIDARG**. The function runs `VirtualQuery` and requires `AllocationBase == address` and `MEM_COMMIT`; Wine reports `MEM_RESERVE` for the window |
+| vkd3d-proton `OpenExistingHeapFromAddress1` (`ID3D12Device13`) on a bridge view or an alias | **OK, the heap is the bridge's memory**. This function never queries; it imports `address` directly |
+| Both functions on a bridge view placed over memory Wine committed (Wine reports `MEM_COMMIT`) | OK |
+| `OpenExistingHeapFromFileMapping` | Not usable: it needs a Wine section handle, and a memfd pool has none |
+
+Caveat: vkd3d-proton falls back without any message to an ordinary allocation when a host import
+fails. The heap still opens, but the GPU no longer sees the title's memory. Code on bridged ranges
+must not take a successful open as proof that the import worked.
+
+**Decides (WS7): yes, through `OpenExistingHeapFromAddress1` only.** NVIDIA 620 imports
+memfd-backed shared views, and so do winevulkan and vkd3d-proton. The bridge does not need to
+answer `VirtualQuery` for this, and does not need to hook it. Changes needed in `inplace.rs`:
+- On bridged ranges, use `From::Part` (`OpenExistingHeapFromAddress1`) and never `From::Region`
+  or `From::Section`. Skip the `VirtualQuery` checks (`private_whole`, `kind_of`) and ask
+  `victory_bridge::query` instead.
+- Wine no longer guards a heap's pages, so the bridge has to. Today Wine refuses to unmap or
+  protect pages under a heap. The bridge does not refuse: an unmap or remap under a standing heap
+  succeeds, and the GPU keeps the old pool pages.
+  - Rule 1: before the bridge remaps a view inside an opened part, drop the heap or re-open it.
+    The existing `views_gone` / `title_memory_freeing` notices are the hook for this.
+  - Rule 2: never punch holes in, or decommit, pool pages a heap holds. Otherwise the GPU and the
+    CPU silently diverge. This rule is untested.
+- An import pins every page, about twice the cost of anonymous memory for pages never touched.
+  Open heaps over parts that are already resident, not over whole pools.
+
+If `From::Region` is ever needed on bridged memory, two routes exist. Both are workable, but
+neither is needed:
+- Place the bridge's view over a range Wine committed. This case was measured OK, but Wine then
+  keeps a view list entry for the range.
+- Patch the `VirtualQuery` entry in vkd3d-proton's import table.
 
 ### S4 results
 
