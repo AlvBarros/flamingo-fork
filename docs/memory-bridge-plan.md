@@ -588,10 +588,10 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
 |---|---|---|---|
 | Re-scope: where do this base's slow frames go | coordinator | `memory-bridge-foxhound` | done: go (17 ms a usual frame, ~119 of a long frame's 145 on the critical path) |
 | WS8 frame log ported to this base | agent | `memory-bridge-foxhound-ws8` | done, merged (76498ca) |
-| WS1 Unix half | agent | `memory-bridge-foxhound-ws1` | in progress |
-| WS2+WS9 PE half, loading, build and packaging | agent | `memory-bridge-foxhound-ws2` | in progress |
-| WS3 xmem on the bridge | agent | `memory-bridge-foxhound-ws3` | in progress |
-| WS4 queries and protections | agent | `memory-bridge-foxhound-ws4` | in progress |
+| WS1 Unix half | agent | `memory-bridge-foxhound-ws1` | done, merged (9a7419f) |
+| WS2+WS9 PE half, loading, build and packaging | agent | `memory-bridge-foxhound-ws2` | done, merged (5569d78) |
+| WS3 xmem on the bridge | agent | `memory-bridge-foxhound-ws3` | done, merged (8826ac1) |
+| WS4 queries and protections | agent | `memory-bridge-foxhound-ws4` | done, merged (4778063) |
 | WS5, WS6 | — | — | after WS3 |
 | WS7 | — | — | later (S3: `OpenExistingHeapFromAddress1` only) |
 
@@ -658,6 +658,15 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
     first (WS4, answered from the bridge's map once title memory is in bridge windows: WS3), then
     the guards and askings (WS5), and the long frames' remapping (WS3). Order: WS1, WS2+WS9, WS3,
     WS4 in parallel now; WS5, WS6 after WS3.
+
+- **Merged** (coordinator): WS2+WS9, WS1, WS4, WS3. Fixed on the way in `victory-bridge`: runs in
+  the map are joined (WS4 measured 132 µs a query at 60,000 views before), but never across
+  windows (WS3's tests have adjacent windows: the first fix panicked there); a failed `MAP` op
+  leaves its range unmapped (WS1); two tests that assumed the DLL never loads skip themselves when
+  it does. With the real DLL beside the tests (`VICTORY_BRIDGE=1`, `test.sh`), `victory-bridge`
+  30/30 and `victory-hle` 188 passed + the base's 2 failures, the same as `=0`. Open: one full
+  `victory-bridge` run in about seven died with the real DLL and the emulator in one process
+  (WS3's note: the emulator re-reserves a window as a placeholder, racy; tests only).
 
 ### WS8 results (foxhound base)
 

@@ -418,7 +418,10 @@ mod system {
 
     #[test]
     fn title_imports_stay_the_hosts_with_the_bridge_off() {
-        assert!(!crate::available());
+        // With VICTORY_BRIDGE=1 and the DLL beside the test the bridge is on.
+        if crate::available() {
+            return;
+        }
         for name in [
             "VirtualAlloc",
             "VirtualFree",

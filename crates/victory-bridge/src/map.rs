@@ -181,7 +181,13 @@ impl Map {
         let mut at = start;
         while let Some(&seg) = self.segs.get(&at) {
             let next_at = at + seg.len;
-            match self.segs.get(&next_at).copied() {
+            // Never across windows: each keeps its own segments.
+            let next = self
+                .segs
+                .get(&next_at)
+                .copied()
+                .filter(|_| !self.windows.contains_key(&next_at));
+            match next {
                 Some(next) if seg.continued_by(&next) => {
                     self.segs.remove(&next_at);
                     self.segs.insert(
@@ -319,6 +325,22 @@ mod tests {
         assert_eq!(m.query(W).unwrap().len, K64);
         assert!(m.map(W + K64, K64, 3, K64 as u64, Prot::READ_WRITE));
         assert_eq!(m.query(W).unwrap().len, 3 * K64);
+    }
+
+    /// Adjacent windows stay apart (joining runs must not cross them).
+    #[test]
+    fn adjacent_windows_are_never_joined() {
+        let mut m = map();
+        assert!(m.add_window(W + 16 * K64, 4 * K64));
+        assert!(m.unmap(W + 15 * K64, K64));
+        assert!(m.unmap(W + 16 * K64, K64));
+        assert_eq!(m.query(W).unwrap().len, 16 * K64);
+        assert_eq!(
+            m.query(W + 16 * K64).unwrap().window,
+            (W + 16 * K64, 4 * K64)
+        );
+        assert_eq!(m.remove_window(W), Some(16 * K64));
+        assert_eq!(m.query(W + 17 * K64).unwrap().len, 3 * K64);
     }
 
     #[test]
