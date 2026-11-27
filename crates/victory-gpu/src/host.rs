@@ -292,6 +292,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
                 Type: D3D12_COMMAND_LIST_TYPE_COPY,
                 ..Default::default()
             })?;
+            crate::drain::track(&queue);
             let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
             let list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
             list.CopyBufferRegion(&to, 0, &from, 0, 16);
@@ -979,6 +980,7 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?,
         };
+        crate::drain::track(&queue);
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
@@ -4735,6 +4737,7 @@ impl Host {
                     Priority: D3D12_COMMAND_QUEUE_PRIORITY_HIGH.0,
                     ..Default::default()
                 })?;
+                crate::drain::track(&queue);
                 Ok(((allocator, list), queue))
             })()
         });

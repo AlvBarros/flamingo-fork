@@ -13,7 +13,7 @@
 # While it runs, type a note and press Enter ("prison starts", "big stutter",
 # "Lucia has no head"): it is stamped with the time and shown beside the long
 # frames in the report. Type q and Enter to end early. At the limit the game
-# is stopped (only this prefix's Wine).
+# is asked to close (scripts/linux/stop-game.sh; killed only if it does not).
 #
 # The report (also saved as report.txt): whether the memory bridge loaded,
 # crashes, frame times per minute, the longest frames with what they were made
@@ -34,7 +34,6 @@ fi
 FORK_HOME=$(FORK_KEYS= scripts/linux/run.sh settings 2>/dev/null | sed -n 's/^fork_home *//p')
 export FORK_HOME
 . scripts/linux/env.sh
-WINESERVER="$(dirname "$WINE")/wineserver"
 
 S="logs/session-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$S"
@@ -94,8 +93,9 @@ while [ "$(date +%s)" -lt "$end" ]; do
 done
 
 echo "Session over ($reason): stopping the game."
-WINEPREFIX="$FORK_HOME/prefix/pfx" "$WINESERVER" -k 2>/dev/null
-sleep 3
+# Never `wineserver -k` first: a kill under running lists once hung NVIDIA's
+# driver and the PC (stop-game.sh).
+scripts/linux/stop-game.sh
 kill "$GPU" "$VM" 2>/dev/null
 wait 2>/dev/null
 python3 -I scripts/linux/session_report.py "$S" "$LOG" | tee "$S/report.txt"

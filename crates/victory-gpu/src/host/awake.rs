@@ -140,6 +140,7 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
             Priority: D3D12_COMMAND_QUEUE_PRIORITY_NORMAL.0,
             ..Default::default()
         })?;
+        crate::drain::track(&queue);
         let mut sum: Option<ID3D12Resource> = None;
         device.CreateCommittedResource(
             &D3D12_HEAP_PROPERTIES {

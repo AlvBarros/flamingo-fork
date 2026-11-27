@@ -45,6 +45,11 @@ fn constrained() -> MutexGuard<'static, Vec<Registration>> {
 /// How long the console lets suspend routines run before it ends the title.
 const SUSPEND_DEADLINE: Duration = Duration::from_secs(1);
 
+/// How long the end waits for the card's work to run out
+/// (`victory_gpu::drain`); a hung card must not keep the process.
+#[cfg(windows)]
+pub(crate) const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+
 const ERROR_INVALID_PARAMETER: u32 = 87;
 
 /// Adds `routine` to `list` and writes its registration id.
@@ -336,11 +341,30 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
+/// Ctrl+C (or Ctrl+Break, or the console closed) in the terminal the game
+/// runs from: the same orderly end as closing the window, in place of the
+/// default (`ExitProcess` at once, under running lists; see `end`).
+unsafe extern "system" fn console_ctrl(kind: u32) -> windows_sys::core::BOOL {
+    tracing::info!(kind, "console control event");
+    end_title("console interrupt", Box::new(|| {}));
+    // The console close event ends the process when the handler returns:
+    // hold it until `end` has drained the card (it ends the process itself).
+    if kind == windows_sys::Win32::System::Console::CTRL_CLOSE_EVENT {
+        std::thread::sleep(SUSPEND_DEADLINE + DRAIN_DEADLINE + Duration::from_secs(1));
+    }
+    1
+}
+
 /// Puts our procedure in front of the title's.
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
         return;
     }
+    static CONSOLE: std::sync::Once = std::sync::Once::new();
+    // SAFETY: a handler that lives for the whole process.
+    CONSOLE.call_once(|| unsafe {
+        windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(console_ctrl), 1);
+    });
     // SAFETY: a window this thread just created. The title's procedure is
     // stored before ours can run.
     unsafe {
@@ -371,8 +395,11 @@ extern "system" fn window_proc(
         _ => {}
     }
     // A user close (close button, Alt+F4, window or taskbar menu); a
-    // console title never sees one, nor a WM_CLOSE from it.
-    if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
+    // console title never sees one, nor a WM_CLOSE from it. A WM_CLOSE alone
+    // is how other programs ask a window to close (Wine's `taskkill` without
+    // /f, which scripts/linux/stop-game.sh sends): the same orderly end, so
+    // the card is idle when the process goes (see `end`).
+    if (message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize) || message == wm::WM_CLOSE {
         end_title("window closed", Box::new(|| {}));
         return 0;
     }
@@ -501,6 +528,11 @@ pub fn wait_for_previous() {
 }
 
 fn end() {
+    // The card's work run out first: a process ended under running lists
+    // faulted the card and once hung NVIDIA's driver in its clean-up, with
+    // the PC (victory_gpu::drain).
+    #[cfg(windows)]
+    victory_gpu::drain(DRAIN_DEADLINE);
     // Compiled host pipelines kept for the next run.
     #[cfg(windows)]
     victory_gpu::pipeline::save_pipeline_cache();

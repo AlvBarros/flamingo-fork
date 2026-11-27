@@ -286,6 +286,9 @@ extern "system" fn report_unhandled(info: *const c_void) -> i32 {
 pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 {
     if process as isize == -1 {
         tracing::warn!(code, from = %host::callers(), "title terminates the process");
+        // As `lifecycle::end`: never under running lists.
+        #[cfg(windows)]
+        victory_gpu::drain(super::lifecycle::DRAIN_DEADLINE);
     }
     host::terminate_process(process, code)
 }

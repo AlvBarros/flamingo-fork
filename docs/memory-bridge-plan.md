@@ -624,6 +624,19 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
   card is busy (end runs gracefully), and the bridge stays off by default. To find out: which title
   pages the GPU has DMA-mapped (vkd3d host-pointer imports, `OpenExistingHeapFromAddress1`, upload
   heaps over title memory) and whether a bridge view is unmapped or its memfd closed while they stand.
+- Follow-up (same day), what was checked and fixed. With the default settings (`VICTORY_INPLACE`
+  and `VICTORY_PORT_CONSTANTS` off) **no title memory is opened as a GPU heap**: the card reads
+  only memory vkd3d allocated, so bridge views are not DMA-mapped and a direct link from the bridge
+  to the stuck teardown is unlikely; the trigger that is certain is a process ended under running
+  lists. The game's own ends did that too (`lifecycle::end`, the title's `TerminateProcess`: no
+  wait for the card). Fix: `victory_gpu::drain` signals a fence on every queue of ours that runs
+  the game's work and waits (5 s at most) before the process ends; a plain `WM_CLOSE` and Ctrl+C
+  in the terminal now take the same orderly end as the close button; `scripts/linux/stop-game.sh`
+  asks the game to close (Wine's `taskkill` without /f), then interrupts it, and kills it only
+  after waiting for the GPU to go idle; `play-session.sh` uses it. **Rule for scripts and agents:
+  end a run with `scripts/linux/stop-game.sh`, never `wineserver -k` or `kill -9` first.** Not
+  covered: a hung card (the deadline passes and the process ends anyway) and the title's CRT
+  `exit` (`victory-loader` `detach_all`, not seen in GTA VI runs).
 
 ### Re-scope
 
