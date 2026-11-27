@@ -235,3 +235,50 @@ no new dropped draws); the measurement goes into the comment above it in `play.e
 - **Windows build**: the bridge crate compiles to stubs there; CI must keep building it.
 - **Upstream merges**: xmem and watch change upstream often; keep the bridge behind the trait so
   merges touch the Windows path only.
+
+## 10. Progress
+
+Live log of the implementation on branch `memory-bridge` (started 2026-11-27). The coordinating
+session owns this section's structure and merges; parallel agents append only inside their own
+subsection below and commit on their own branch (`memory-bridge-<ws>`), never on `memory-bridge`.
+
+Rules in force: `VICTORY_BRIDGE` defaults to off and `=0` behaves exactly as before; tests pass
+both ways; `cargo xtask policy` passes before every push; game runs are announced in **Runs** below
+before they start and never overlap (spikes use their own throwaway Wine prefixes, not the game's).
+
+### Status
+
+| Item | Owner | Branch | State |
+|---|---|---|---|
+| WS0 contract | coordinator | `memory-bridge` | in progress |
+| S1 uffd WP-async + PAGEMAP_SCAN under Proton | agent | `memory-bridge-s1` | in progress |
+| S2 Wine's behaviour on the window | agent | `memory-bridge-s2` | in progress |
+| S3 external_memory_host on memfd (NVIDIA) | agent | `memory-bridge-s3` | in progress |
+| S4 cost of `__wine_unix_call` and batches | agent | `memory-bridge-s4` | in progress |
+| WS1-WS9 | — | — | waiting for spike results |
+
+### Runs
+
+(Announce each game run here, with start time and who, before starting it.)
+
+- none yet
+
+### WS0 results
+
+(pending)
+
+### S1 results
+
+(pending)
+
+### S2 results
+
+(pending)
+
+### S3 results
+
+(pending)
+
+### S4 results
+
+(pending)
