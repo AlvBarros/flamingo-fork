@@ -95,6 +95,17 @@ pub extern "system" fn XMemVirtualAlloc(
     if !base.is_null() {
         materialize_for(base as usize, size, Touch::TitleCall);
     }
+    // In a window of the memory bridge's: a part of its reservation the
+    // title cut out is one still (nothing to do); a commit must not reach
+    // the host (spike S2: it would take the pages for its own and protect
+    // the bridge's views), and fails as it does in a placeholder.
+    if !base.is_null() && victory_bridge::bridged(base as usize) {
+        if kind & MEM_COMMIT == 0 {
+            return base;
+        }
+        tracing::warn!(size, kind = format_args!("{kind:#x}"), at = format_args!("{base:p}"), "XMemVirtualAlloc: no commit in the memory bridge's window");
+        return std::ptr::null_mut();
+    }
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -127,6 +138,13 @@ pub extern "system" fn XMemVirtualAlloc(
     if placeholder {
         kind |= MEM_RESERVE | MEM_RESERVE_PLACEHOLDER;
     }
+    // With the memory bridge, what would be a placeholder is a plain
+    // reservation of the host's, handed to the bridge as its window once
+    // made: the pages mapped there are the bridge's to map.
+    let window = kind & MEM_RESERVE_PLACEHOLDER != 0 && kind & MEM_COMMIT == 0 && bridge_on();
+    if window {
+        kind = (kind & !MEM_RESERVE_PLACEHOLDER) | MEM_RESERVE;
+    }
     let mut parameter = MEM_EXTENDED_PARAMETER::default();
     parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
     parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
@@ -137,7 +155,7 @@ pub extern "system" fn XMemVirtualAlloc(
         // The GPU side copies only the pages the title wrote since its last
         // copy (`victory_gpu`, decision 0007); placeholders cannot be
         // watched (their physical-page views are copied whole).
-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        if kind & MEM_RESERVE_PLACEHOLDER == 0 && !window {
             kind |= MEM_WRITE_WATCH;
         }
     }
@@ -158,6 +176,12 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if window && !at.is_null() && !victory_bridge::window_add(at as usize, size.next_multiple_of(4096)) {
+        tracing::warn!(size, at = format_args!("{at:p}"), "XMemVirtualAlloc: the memory bridge refused the reservation as its window");
+        // SAFETY: the reservation just made.
+        unsafe { VirtualFree(at, 0, MEM_RELEASE) };
+        return std::ptr::null_mut();
+    }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -245,7 +269,14 @@ pub extern "system" fn XMemVirtualQuery(
     // SAFETY: the title passes room for the whole structure; the host
     // fails on a null one.
     unsafe {
-        if VirtualQueryEx(process, address, out.cast(), size) == 0 {
+        // The memory bridge's window: its own answer (the host's is
+        // "reserved" throughout). The title asks of itself.
+        let asked = if victory_bridge::bridged(address as usize) {
+            victory_bridge::virtual_query(address, out.cast(), size)
+        } else {
+            VirtualQueryEx(process, address, out.cast(), size)
+        };
+        if asked == 0 {
             return 0;
         }
         let info = &mut *out;
@@ -401,7 +432,10 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 const PAGE: usize = 64 << 10;
 
 struct Section {
+    /// The host's section; null for a pool of the memory bridge's.
     handle: HANDLE,
+    /// The memory bridge's pool instead of a section ([`bridge_on`]).
+    pool: Option<victory_bridge::Pool>,
     pages: usize,
     /// A view of the whole section, kept ([`Section::window`]); 0 if the
     /// host gave none.
@@ -410,7 +444,44 @@ struct Section {
     committed: Box<[std::sync::atomic::AtomicU64]>,
 }
 
+/// A section's number for the GPU side (`victory_gpu::title_memory_view`,
+/// its census of views): the handle; for a pool of the bridge's, which has
+/// none, the pool's id with this bit, which no handle has.
+const BRIDGED_ID: usize = 1 << 62;
+
 impl Section {
+    /// What the GPU side knows the section by ([`BRIDGED_ID`]).
+    fn id(&self) -> usize {
+        match &self.pool {
+            Some(pool) => BRIDGED_ID | pool.id() as usize,
+            None => self.handle as usize,
+        }
+    }
+
+    /// Our view of a pool of the bridge's, all of it: a reservation of its
+    /// own handed to the bridge, the pool mapped there in one call. 0 if
+    /// either refuses.
+    fn bridge_window(&self, pool: &victory_bridge::Pool) -> usize {
+        use victory_bridge::PagePool;
+        let len = self.pages * PAGE;
+        // SAFETY: a plain reservation.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        if at == 0 {
+            return 0;
+        }
+        if victory_bridge::window_add(at, len) {
+            let op = victory_bridge::MapOp { addr: at, len, offset: 0, prot: victory_bridge::Prot::READ_WRITE, watch: false };
+            if bridge_call(|| pool.map(&[op])) == [true] {
+                return at;
+            }
+            victory_bridge::window_remove(at);
+        }
+        tracing::warn!(len, "no view of a pool of the memory bridge's beside the title's");
+        // SAFETY: our reservation, the bridge's no more.
+        unsafe { VirtualFree(at as *mut c_void, 0, MEM_RELEASE) };
+        0
+    }
+
     /// Where bytes of `n` pages from page `index` on can be written,
     /// whether or not the pages are mapped anywhere, committed.
     ///
@@ -420,18 +491,20 @@ impl Section {
     /// title's own mapping calls (about 100,000 views of one page) and our
     /// guards asking for the same lock. One view of the section, kept,
     /// costs that once per page.
-    /// `VICTORY_SECTION_WINDOW=0`: a view for each write, as before.
+    /// `VICTORY_SECTION_WINDOW=0`: a view for each write, as before (not
+    /// for a pool of the bridge's, which has no other way: [`View::map`]).
     fn window(&self, index: usize, n: usize) -> Option<usize> {
         use std::sync::atomic::Ordering;
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         static ON: LazyLock<bool> =
             LazyLock::new(|| std::env::var_os("VICTORY_SECTION_WINDOW").is_none_or(|v| v != "0"));
-        if !*ON || index + n > self.pages {
+        if (!*ON && self.pool.is_none()) || index + n > self.pages {
             return None;
         }
-        let base = *self.window.get_or_init(|| {
+        let base = *self.window.get_or_init(|| match &self.pool {
+            Some(pool) => self.bridge_window(pool),
             // SAFETY: the whole of a section we own.
-            unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize
+            None => unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, self.pages * PAGE) }.Value as usize,
         });
         if base == 0 {
             return None;
@@ -447,7 +520,8 @@ impl Section {
             if run == 0 {
                 continue; // another worker committed it meanwhile
             }
-            if !commit(base + page * PAGE, run * PAGE) {
+            // (A pool of the bridge's needs no commit: its pages are there.)
+            if self.pool.is_none() && !commit(base + page * PAGE, run * PAGE) {
                 return None;
             }
             for p in page..page + run {
@@ -475,7 +549,9 @@ impl Section {
         if lean() && done() {
             return true;
         }
-        if !counted(Call::Commit, || commit(base, len)) {
+        // (A pool of the bridge's needs no commit; its bits are kept all the
+        // same, for [`arrange`].)
+        if self.pool.is_none() && !counted(Call::Commit, || commit(base, len)) {
             return false;
         }
         for p in pages {
@@ -494,6 +570,18 @@ unsafe impl Sync for Section {}
 impl Drop for Section {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        if self.pool.is_some() {
+            // Our view goes with its window; the pool goes when dropped
+            // (the title's views of it stay until unmapped).
+            if let Some(&base) = self.window.get()
+                && base != 0
+                && victory_bridge::window_remove(base).is_some()
+            {
+                // SAFETY: our reservation, the bridge's no more.
+                unsafe { VirtualFree(base as *mut c_void, 0, MEM_RELEASE) };
+            }
+            return;
+        }
         if let Some(&base) = self.window.get()
             && base != 0
         {
@@ -691,6 +779,9 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
+    if bridge_on() {
+        return allocate_bridged(flags, n, count, pages);
+    }
     // A pagefile-backed section of `size` bytes, its pages committed when
     // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
@@ -726,10 +817,45 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section {
         handle,
+        pool: None,
         pages: n,
         window: std::sync::OnceLock::new(),
         committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
     });
+    give_pages(section, n, pages);
+    1
+}
+
+/// [`XMemAllocatePhysicalPages`] with the memory bridge on ([`bridge_on`]):
+/// a pool of the bridge's (one memfd, its pages there when first touched)
+/// in place of the section. The GPU side is not told of it as a section
+/// (`victory_gpu::title_memory_section`): that is for opening a section as
+/// a heap (`OpenExistingHeapFromFileMapping`) and for a view of it of the
+/// GPU side's own (`MapViewOfFile`), neither of which can work on a pool
+/// (spikes S2, S3: only `OpenExistingHeapFromAddress1` imports bridge
+/// memory); its views are told of as before, under [`Section::id`].
+fn allocate_bridged(flags: u64, n: usize, count: *mut usize, pages: *mut usize) -> BOOL {
+    use victory_bridge::PagePool;
+    let Some(pool) = bridge_call(|| victory_bridge::Pool::create((n * PAGE) as u64)) else {
+        tracing::warn!(n, "XMemAllocatePhysicalPages: the memory bridge made no pool");
+        // SAFETY: checked non-null by the caller.
+        unsafe { count.write(0) };
+        return 0;
+    };
+    tracing::debug!(n, flags = format_args!("{flags:#x}"), pool = pool.id(), "XMemAllocatePhysicalPages, on the memory bridge");
+    let section = Arc::new(Section {
+        handle: std::ptr::null_mut(),
+        pool: Some(pool),
+        pages: n,
+        window: std::sync::OnceLock::new(),
+        committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+    });
+    give_pages(section, n, pages);
+    1
+}
+
+/// Numbers the `n` pages of a new section and hands them to the title.
+fn give_pages(section: Arc<Section>, n: usize, pages: *mut usize) {
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
@@ -747,7 +873,6 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(first + index * FRAMES) };
     }
-    1
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -775,12 +900,19 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
 struct View {
     at: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
+    /// A pool of the bridge's: `at` is in its own view of the pool, which
+    /// this holds; nothing to unmap.
+    kept: Option<Arc<Section>>,
 }
 
 impl View {
     /// Maps `n` slices from `slice` on.
     fn map(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        if slice.section.pool.is_some() {
+            let at = slice.section.window(slice.index, n)?;
+            return Some(View { at: MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }, len: n * PAGE, kept: Some(slice.section.clone()) });
+        }
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
@@ -796,7 +928,7 @@ impl View {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not mapped for a write");
             return None;
         }
-        let view = View { at, len };
+        let view = View { at, len, kept: None };
         if !commit(at.Value as usize, len) {
             tracing::warn!(error = %std::io::Error::last_os_error(), n, "physical pages not committed for a write");
             return None;
@@ -815,6 +947,9 @@ impl View {
 impl Drop for View {
     fn drop(&mut self) {
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        if self.kept.is_some() {
+            return;
+        }
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(self.at) };
     }
@@ -1084,6 +1219,126 @@ fn told(f: impl FnOnce()) {
     timed(T::RemapNotes, T::RemapNoteNs, f);
 }
 
+// The memory bridge (`victory_bridge`, docs/memory-bridge-plan.md, WS3):
+// with it on, physical pages are pools of the bridge's and reservations of
+// 64 KiB pages are its windows, in which only the bridge maps, unmaps and
+// protects. What changes here is the system calls alone: the views
+// ([`Physical`]), [`Shown`], the holes, the page table and every notice to
+// the GPU side are kept as before and in the same order against the
+// mapping. Each mapping call of the title's, each page-mapping copy and
+// each group of [`change`] is one bridge call to map (per pool) and one to
+// unmap, on the calling thread; a view mapped where another was replaces it
+// (no unmapping first, no placeholder to split). Whether memory is the
+// bridge's is asked of the bridge (`victory_bridge::bridged`); without the
+// bridge that is always no and nothing here runs.
+
+/// Whether new physical pages and new reservations of 64 KiB pages go to
+/// the memory bridge (`VICTORY_BRIDGE`, and the bridge loaded). In tests
+/// only on a thread that asks for it (`tests::BRIDGE`), so that the present
+/// path is tested in the same process.
+fn bridge_on() -> bool {
+    #[cfg(test)]
+    if !tests::BRIDGE.get() {
+        return false;
+    }
+    victory_bridge::available()
+}
+
+/// Runs `f`, a call to the memory bridge, counted into the frame log's
+/// totals (`victory_gpu::framelog`: xmem's bridge calls, beside its
+/// Windows calls).
+fn bridge_call<T>(f: impl FnOnce() -> T) -> T {
+    use victory_gpu::framelog::{T as F, add};
+    let started = std::time::Instant::now();
+    let done = f();
+    add(F::RemapBridgeCalls, 1);
+    add(F::RemapBridgeNs, started.elapsed().as_nanos() as u64);
+    done
+}
+
+/// Maps each `(address, bytes, first slice)` in the bridge's windows,
+/// replacing what is there: one bridge call per pool. Whether each was
+/// mapped (a section of the host's has no place there: no).
+fn bridge_map(pieces: &[(usize, usize, Slice)]) -> Vec<bool> {
+    use victory_bridge::PagePool;
+    let mut done = vec![false; pieces.len()];
+    let mut pools: Vec<(&Arc<Section>, Vec<usize>)> = Vec::new();
+    for (i, (at, _, slice)) in pieces.iter().enumerate() {
+        if slice.section.pool.is_none() {
+            tracing::warn!(at = format_args!("{at:#x}"), "physical pages of a section of the host's not mapped where the memory bridge maps");
+            continue;
+        }
+        match pools.iter_mut().find(|(s, _)| Arc::ptr_eq(s, &slice.section)) {
+            Some((_, of)) => of.push(i),
+            None => pools.push((&slice.section, vec![i])),
+        }
+    }
+    for (section, of) in pools {
+        let Some(pool) = &section.pool else { continue };
+        let ops: Vec<victory_bridge::MapOp> = of
+            .iter()
+            .map(|&i| {
+                let (addr, len, slice) = &pieces[i];
+                victory_bridge::MapOp {
+                    addr: *addr,
+                    len: *len,
+                    offset: (slice.index * PAGE) as u64,
+                    prot: victory_bridge::Prot::READ_WRITE,
+                    watch: false,
+                }
+            })
+            .collect();
+        let mapped = bridge_call(|| pool.map(&ops));
+        for (&i, mapped) in of.iter().zip(mapped) {
+            let (addr, len, slice) = &pieces[i];
+            // (Only its bits, for [`arrange`]: a pool needs no commit.)
+            done[i] = mapped && section.commit_shown(slice.index, *addr, *len);
+        }
+    }
+    done
+}
+
+/// Returns `ranges` of the bridge's windows to unmapped, in one bridge call;
+/// whether all were.
+fn bridge_unmap(ranges: &[(usize, usize)]) -> bool {
+    if ranges.is_empty() {
+        return true;
+    }
+    let done = bridge_call(|| victory_bridge::unmap(ranges));
+    let all = done.iter().all(|&d| d);
+    if !all {
+        tracing::warn!(ranges = ranges.len(), refused = done.iter().filter(|&&d| !d).count(), "the memory bridge did not unmap title memory");
+    }
+    all
+}
+
+/// `ranges` less the bytes of `taken` (which do not overlap each other).
+fn minus(ranges: &[(usize, usize)], taken: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut taken = taken.to_vec();
+    taken.sort_unstable();
+    let mut out = Vec::new();
+    for &(at, len) in ranges {
+        let (mut from, end) = (at, at + len);
+        let mut i = taken.partition_point(|&(t, n)| t + n <= from);
+        while from < end {
+            match taken.get(i) {
+                Some(&(t, n)) if t < end => {
+                    if t > from {
+                        out.push((from, t - from));
+                    }
+                    from = from.max(t + n);
+                    i += 1;
+                }
+                _ => {
+                    out.push((from, end - from));
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Counts a mapping call when dropped: in every build into the frame log's
 /// totals (`victory_gpu::framelog`), and into [`MAPPING`] while the
 /// streaming log is on.
@@ -1304,6 +1559,9 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize, lazy: bool) ->
     if let Some(costed) = &mut costed {
         costed.waited = costed.started.elapsed().as_nanos() as u64;
     }
+    if victory_bridge::bridged(base) {
+        return map_pages_bridged(&mut physical, address, n, pages, lazy);
+    }
     unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
         return address;
@@ -1336,6 +1594,77 @@ fn map_pages(address: *mut c_void, n: usize, pages: *const usize, lazy: bool) ->
     address
 }
 
+/// [`map_pages`] in a window of the memory bridge's: what the range showed
+/// goes from the books, the runs of consecutive pages are mapped in one
+/// bridge call (each replacing what was there), and only what of the range
+/// no new view covers is unmapped, in one call more. Every run is tried (a
+/// run the bridge refuses does not stop the others, as it did the host's);
+/// an unknown page stops there, as before.
+fn map_pages_bridged(physical: &mut Physical, address: *mut c_void, n: usize, pages: Option<Vec<usize>>, lazy: bool) -> *mut c_void {
+    let base = address as usize;
+    let pending = unmap_bridged(physical, base, n * PAGE);
+    let Some(pages) = pages else {
+        bridge_unmap(&pending);
+        return address;
+    };
+    let slices: Vec<Option<Slice>> = {
+        let table = page_table();
+        pages.iter().map(|page| table.pages.get(page).cloned()).collect()
+    };
+    let (mut runs, mut known, mut i) = (Vec::new(), true, 0);
+    while i < n {
+        let Some(first) = slices[i].clone() else {
+            tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
+            known = false;
+            break;
+        };
+        let run = 1 + slices[i + 1..]
+            .iter()
+            .zip(1..)
+            .take_while(|&(slice, k)| {
+                slice.as_ref().is_some_and(|s| Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k)
+            })
+            .count();
+        runs.push((base + i * PAGE, run * PAGE, first));
+        i += run;
+    }
+    let (eager, books) = if lazy { (Vec::new(), runs) } else { (runs, Vec::new()) };
+    let placed = place_bridged(physical, eager, books, &pending, Soft::NotedPool);
+    if placed && known { address } else { std::ptr::null_mut() }
+}
+
+/// Puts views in a window of the memory bridge's, after [`unmap_bridged`]
+/// took what was there from the books (`pending`: what of it the bridge
+/// still shows): `eager` mapped in one bridge call per pool and noted, then
+/// what of `pending` they do not cover unmapped in one call, then `books`
+/// noted in the books alone ([`map_lazy`], `who` counted). Whether all
+/// went.
+fn place_bridged(
+    physical: &mut Physical,
+    eager: Vec<(usize, usize, Slice)>,
+    books: Vec<(usize, usize, Slice)>,
+    pending: &[(usize, usize)],
+    who: Soft,
+) -> bool {
+    let done = bridge_map(&eager);
+    let (mut ok, mut shown) = (true, Vec::with_capacity(eager.len()));
+    for ((at, len, slice), done) in eager.into_iter().zip(done) {
+        if !done {
+            tracing::warn!(address = format_args!("{at:#x}"), len, "the memory bridge did not map physical pages");
+            ok = false;
+            continue;
+        }
+        physical.holes.remove(&at);
+        noted(physical, at, len, slice);
+        shown.push((at, len));
+    }
+    ok &= bridge_unmap(&minus(pending, &shown));
+    for (at, len, slice) in books {
+        ok &= map_lazy(physical, at, len, slice, Some(who));
+    }
+    ok
+}
+
 /// One page at each address; null `pages`, or a page number 0, unmaps
 /// (the title passes 0 for addresses to clear).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
@@ -1347,7 +1676,12 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         return 0;
     }
     lift_thread();
-    if side_by_side() > 1 && n > 1 {
+    // With the memory bridge a list is one bridge call, on this thread,
+    // whatever `VICTORY_MAP_THREADS` says (unless the title's views are kept
+    // in the books alone: a page at a time, as below).
+    // SAFETY: the title passes `n` addresses.
+    let bridged = || n > 1 && !lazy_views() && soft_views() & SOFT_POOL == 0 && victory_bridge::bridged(unsafe { *addresses } as usize);
+    if (side_by_side() > 1 || bridged()) && n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.
         let wanted: Vec<(usize, usize)> = (0..n)
             // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
@@ -1402,6 +1736,9 @@ fn alias_as(to: u64, from: u64, len: u64, runs_in_one: bool, lazy: bool) -> bool
     // before the views, as there).
     let _changing = victory_gpu::title_memory_remapping();
     let mut physical = physical();
+    if victory_bridge::bridged(to) {
+        return alias_bridged(&mut physical, to, from, len, runs_in_one, lazy);
+    }
     unmap(&mut physical, to, len);
     if from == 0 {
         return true;
@@ -1475,6 +1812,65 @@ fn alias_as(to: u64, from: u64, len: u64, runs_in_one: bool, lazy: bool) -> bool
         }
     }
     found
+}
+
+/// [`alias_as`] in a window of the memory bridge's: the same pages, the
+/// same views (a view per run with `runs_in_one`, else per page), mapped in
+/// one bridge call; then what of `to` no new view covers unmapped in one
+/// more ([`map_pages_bridged`]).
+fn alias_bridged(physical: &mut Physical, to: usize, from: usize, len: usize, runs_in_one: bool, lazy: Option<Soft>) -> bool {
+    if from == 0 {
+        unmap(physical, to, len);
+        return true;
+    }
+    // A range mapped onto itself (shifted): page by page as it changes, as
+    // before (a bridge call each).
+    if to < from + len && from < to + len {
+        unmap(physical, to, len);
+        for k in (0..len).step_by(PAGE) {
+            let Some(slice) = physical.slice_at(from + k) else {
+                return false;
+            };
+            if !place(physical, to + k, PAGE, slice, lazy) {
+                return false;
+            }
+        }
+        return true;
+    }
+    let pending = unmap_bridged(physical, to, len);
+    let mut slices = Vec::with_capacity(len / PAGE);
+    let mut found = true;
+    for k in (0..len).step_by(PAGE) {
+        match physical.slice_at(from + k) {
+            Some(slice) => slices.push(slice),
+            None => {
+                found = false;
+                break;
+            }
+        }
+    }
+    let runs = runs_of(&slices);
+    if super::dstorage::stream_log::on() {
+        MAPPING[15].fetch_add(slices.len() as u64, Ordering::Relaxed);
+        MAPPING[16].fetch_add((slices.len() - runs.len()) as u64, Ordering::Relaxed);
+    }
+    let pieces: Vec<(usize, usize, Slice)> = if runs_in_one && lazy.is_none() {
+        let mut k = 0;
+        runs.iter()
+            .map(|&run| {
+                let piece = (to + k * PAGE, run * PAGE, slices[k].clone());
+                k += run;
+                piece
+            })
+            .collect()
+    } else {
+        slices.into_iter().enumerate().map(|(k, slice)| (to + k * PAGE, PAGE, slice)).collect()
+    };
+    let placed = match lazy {
+        Some(who) => place_bridged(physical, Vec::new(), pieces, &pending, who),
+        None => place_bridged(physical, pieces, Vec::new(), &pending, Soft::NotedCopies),
+    };
+    placed && found
 }
 
 /// Whether `[base, base + len)`, all placeholders after an unmapping, is
@@ -1554,7 +1950,11 @@ fn alias_runs() -> bool {
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _costed = Costed::begin(None);
     lift_thread();
-    if side_by_side() <= 1 {
+    // With the memory bridge: in groups of one bridge call each, whatever
+    // `VICTORY_MAP_THREADS` says, unless the copies' views are kept in the
+    // books alone (then range by range, as below).
+    let bridged = soft_views() & SOFT_COPIES == 0 && ranges.first().is_some_and(|r| victory_bridge::bridged(r.0 as usize));
+    if side_by_side() <= 1 && !bridged {
         return ranges.iter().all(|&(to, from, len)| alias(to, from, len));
     }
     // By the page: the address, and the one whose page it is to show.
@@ -1775,6 +2175,9 @@ impl Op {
 /// With [`PHYSICAL`] and the change of mapping (`title_memory_remapping`)
 /// held.
 fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
+    if ops.iter().any(|op| victory_bridge::bridged(op.at)) {
+        return change_bridged(physical, ops);
+    }
     for op in &mut ops {
         let there = physical
             .views
@@ -1826,7 +2229,7 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
                 // As in `map`.
                 shown_mut().note(op.at, PAGE, &slice);
                 told(|| victory_gpu::title_memory_remapped(op.at, PAGE));
-                told(|| victory_gpu::title_memory_view(op.at, PAGE, slice.section.handle as usize, (slice.index * PAGE) as u64));
+                told(|| victory_gpu::title_memory_view(op.at, PAGE, slice.section.id(), (slice.index * PAGE) as u64));
                 physical.views.insert(op.at, (PAGE, slice));
             }
             None if op.had && done => {
@@ -1836,6 +2239,69 @@ fn change(physical: &mut Physical, mut ops: Vec<Op>) -> bool {
         }
     }
     ok
+}
+
+/// [`change`] in a window of the memory bridge's: the same books and
+/// notices, page by page as there; then the pages to show mapped in one
+/// bridge call (per pool), each replacing what was there, on this thread;
+/// then what was shown and is not any more unmapped in one call. Per page,
+/// whether the bridge did it, as [`change`] has it from the host.
+fn change_bridged(physical: &mut Physical, ops: Vec<Op>) -> bool {
+    let mut pending: Vec<(usize, usize)> = Vec::new();
+    let mut ok = true;
+    for op in &ops {
+        if !victory_bridge::bridged(op.at) {
+            tracing::warn!(address = format_args!("{:#x}", op.at), "a page mapped with others in the memory bridge's window is not in one");
+            ok = false;
+            continue;
+        }
+        let there = physical
+            .views
+            .range(..=op.at)
+            .next_back()
+            .filter(|(base, view)| op.at < **base + view.0)
+            .map(|(base, view)| (*base, view.0));
+        match there {
+            Some((base, PAGE)) if base == op.at => {
+                if let Some((size, slice)) = physical.views.remove(&op.at) {
+                    shown_mut().forget(op.at, size, &slice);
+                }
+                told(|| victory_gpu::title_memory_unmapping(op.at, PAGE));
+                physical.holes.remove(&op.at);
+                if unlazy(op.at) {
+                    // Only in our books: nothing of the bridge's there.
+                    count(Soft::Gone, 1);
+                } else {
+                    pending.push((op.at, PAGE));
+                }
+                if op.slice.is_none() {
+                    physical.holes.insert(op.at, PAGE);
+                }
+            }
+            // Part of a larger view.
+            Some(_) => pending.extend(unmap_bridged(physical, op.at, PAGE)),
+            None => {}
+        }
+        if op.slice.is_some() {
+            physical.holes.remove(&op.at);
+        }
+    }
+    let pieces: Vec<(usize, usize, Slice)> = ops
+        .into_iter()
+        .filter(|op| victory_bridge::bridged(op.at))
+        .filter_map(|op| op.slice.map(|slice| (op.at, PAGE, slice)))
+        .collect();
+    let done = bridge_map(&pieces);
+    let mut shown = Vec::with_capacity(pieces.len());
+    for ((at, len, slice), done) in pieces.into_iter().zip(done) {
+        if done {
+            noted(physical, at, len, slice);
+            shown.push((at, len));
+        } else {
+            ok = false;
+        }
+    }
+    ok & bridge_unmap(&minus(&pending, &shown))
 }
 
 /// The threads that do the system calls of [`change`].
@@ -1970,6 +2436,13 @@ fn map_as(physical: &mut Physical, base: usize, len: usize, slice: Slice, quiet:
     if !show_as(base, len, &slice, own, quiet) {
         return false;
     }
+    noted(physical, base, len, slice);
+    true
+}
+
+/// What [`map`] notes of a view mapped at `[base, base + len)`, and tells
+/// the GPU side.
+fn noted(physical: &mut Physical, base: usize, len: usize, slice: Slice) {
     // Noted before the GPU side is told: bytes DirectStorage put in earlier,
     // without notice at these addresses ([`pages_written`]), are there by
     // the time the copies of them go.
@@ -1977,9 +2450,8 @@ fn map_as(physical: &mut Physical, base: usize, len: usize, slice: Slice, quiet:
     // New contents, read-write: the GPU side's copies no longer guard it.
     told(|| victory_gpu::title_memory_remapped(base, len));
     // What the range shows now, for the GPU side's in-place census.
-    told(|| victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64));
+    told(|| victory_gpu::title_memory_view(base, len, slice.section.id(), (slice.index * PAGE) as u64));
     physical.views.insert(base, (len, slice));
-    true
 }
 
 /// Cuts `[base, base + len)` out of the placeholder it is in (which fails
@@ -2003,6 +2475,14 @@ fn show(base: usize, len: usize, slice: &Slice, own: bool) -> bool {
 
 /// [`show`]; `quiet`: a failure to map is not said.
 fn show_as(base: usize, len: usize, slice: &Slice, own: bool, quiet: bool) -> bool {
+    // The memory bridge's window: one bridge call, over whatever is there.
+    if victory_bridge::bridged(base) {
+        let shown = bridge_map(&[(base, len, slice.clone())]) == [true];
+        if !shown && !quiet {
+            tracing::warn!(address = format_args!("{base:#x}"), len, "the memory bridge did not map physical pages");
+        }
+        return shown;
+    }
     let map_view = || {
         // SAFETY: maps the section over a placeholder; acts only on one.
         counted(Call::Map, || unsafe {
@@ -2113,6 +2593,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     if len == 0 {
         return;
     }
+    if victory_bridge::bridged(base) {
+        let pending = unmap_bridged(physical, base, len);
+        bridge_unmap(&pending);
+        return;
+    }
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
@@ -2174,6 +2659,69 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             map(physical, end, at + size - end, Slice { index, ..slice });
         }
     }
+}
+
+/// [`unmap`] in a window of the memory bridge's, as far as the books go:
+/// the views that touch `[base, base + len)` are forgotten and told of as
+/// there, what stays of them outside it is noted again (the bridge shows it
+/// still: only the part inside goes, with no new view), and the parts
+/// inside that the bridge shows are returned for the caller to unmap (or
+/// to map over: [`place_bridged`]).
+fn unmap_bridged(physical: &mut Physical, base: usize, len: usize) -> Vec<(usize, usize)> {
+    let mut pending = Vec::new();
+    if len == 0 {
+        return pending;
+    }
+    let end = base + len;
+    let first = physical
+        .views
+        .range(..=base)
+        .next_back()
+        .filter(|(at, (size, _))| *at + size > base)
+        .map(|(at, _)| *at);
+    let hit: Vec<usize> = first.into_iter().chain(physical.views.range(base + 1..end).map(|(at, _)| *at)).collect();
+    let mut stays = Vec::new();
+    for at in hit {
+        let Some((size, slice)) = physical.views.remove(&at) else {
+            continue;
+        };
+        shown_mut().forget(at, size, &slice);
+        if at < base || at + size > end {
+            told(|| victory_gpu::title_memory_splitting(at, size));
+        }
+        told(|| victory_gpu::title_memory_unmapping(at, size));
+        if unlazy(at) {
+            // In the books alone, as in [`unmap`].
+            count(Soft::Gone, 1);
+            if at >= base && at + size <= end {
+                physical.holes.insert(at, size);
+            }
+            if at < base {
+                map_lazy(physical, at, base - at, slice.clone(), None);
+            }
+            if at + size > end {
+                let index = slice.index + (end - at) / PAGE;
+                map_lazy(physical, end, at + size - end, Slice { index, ..slice }, None);
+            }
+            continue;
+        }
+        let (from, to) = (at.max(base), (at + size).min(end));
+        pending.push((from, to - from));
+        if at >= base && at + size <= end {
+            physical.holes.insert(at, size);
+        }
+        if at < base {
+            stays.push((at, base - at, slice.clone()));
+        }
+        if at + size > end {
+            let index = slice.index + (end - at) / PAGE;
+            stays.push((end, at + size - end, Slice { index, ..slice }));
+        }
+    }
+    for (at, len, slice) in stays {
+        noted(physical, at, len, slice);
+    }
+    pending
 }
 
 /// Whether the title's own mapping calls (`XMemMapPhysicalPages`) map
@@ -2478,7 +3026,9 @@ fn map_lazy(physical: &mut Physical, base: usize, len: usize, slice: Slice, who:
         return map(physical, base, len, slice);
     }
     let own = physical.holes.remove(&base) == Some(len);
-    if !own {
+    // (The memory bridge's window has no placeholders: the caller unmapped
+    // what was there, [`place_bridged`].)
+    if !own && !victory_bridge::bridged(base) {
         split(base, len);
         if !one_placeholder_there(base, len) {
             return map(physical, base, len, slice);
@@ -2498,7 +3048,7 @@ fn map_lazy(physical: &mut Physical, base: usize, len: usize, slice: Slice, who:
     }
     shown_mut().note(base, len, &slice);
     told(|| victory_gpu::title_memory_remapped(base, len));
-    told(|| victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64));
+    told(|| victory_gpu::title_memory_view(base, len, slice.section.id(), (slice.index * PAGE) as u64));
     physical.views.insert(base, (len, slice));
     if let Some(who) = who {
         count(Soft::Noted, 1);
@@ -2771,6 +3321,9 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
 /// first: the address may be other memory's the moment it is free.
 extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
     const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    if victory_bridge::bridged(address as usize) {
+        return bridged_free(address, size, kind);
+    }
     // A lazy view there is a view to the title (whose calls on it then fail
     // as they did), not the placeholder the host has.
     materialize_for(address as usize, size, Touch::TitleCall);
@@ -2782,12 +3335,58 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
     unsafe { VirtualFree(address, size, kind) }
 }
 
+/// [`title_virtual_free`] in a window of the memory bridge's, where the host
+/// must not free or decommit anything (spike S2: it would unmap the
+/// bridge's views). Splitting and joining what was a placeholder is
+/// nothing to do. The whole reservation released: its views go (from the
+/// books and the bridge, the GPU side told as for an unmapping), the window
+/// goes back to the host, which releases it. A part of it released alone
+/// (the title cut it out) is unmapped and stays reserved until the rest
+/// goes (shortcut: its addresses are not free for others meanwhile). A
+/// decommit fails, as in a placeholder.
+fn bridged_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+    use windows_sys::Win32::Foundation::{ERROR_INVALID_ADDRESS, SetLastError};
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    if kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) != 0 {
+        return 1;
+    }
+    let at = address as usize;
+    let window = victory_bridge::query(at).map(|r| r.window);
+    if kind & MEM_RELEASE == 0 || window.is_none() {
+        // SAFETY: plain call.
+        unsafe { SetLastError(ERROR_INVALID_ADDRESS) };
+        return 0;
+    }
+    let (base, len) = window.unwrap_or_default();
+    let whole = at == base;
+    victory_gpu::title_memory_freed(at, size);
+    {
+        let _changing = victory_gpu::title_memory_remapping();
+        let mut physical = physical();
+        unmap(&mut physical, at, if whole { len } else { size });
+    }
+    if !whole {
+        return 1;
+    }
+    if victory_bridge::window_remove(base).is_none() {
+        tracing::warn!(at = format_args!("{base:#x}"), len, "the memory bridge kept a window the title released");
+        return 0;
+    }
+    // SAFETY: the title's own reservation, the bridge's no more.
+    unsafe { VirtualFree(address, 0, MEM_RELEASE) }
+}
+
 /// The title's own `VirtualQuery`, while views are kept in the books alone
 /// ([`soft_views`]): such a view at the address is a view to the title, not
 /// the placeholder the host has.
 extern "system" fn title_virtual_query(address: *const c_void, out: *mut MEMORY_BASIC_INFORMATION, size: usize) -> usize {
     use windows_sys::Win32::System::Memory::VirtualQuery;
     materialize_for(address as usize, 1, Touch::TitleCall);
+    // The memory bridge's window: its answer, not the host's.
+    if victory_bridge::bridged(address as usize) {
+        // SAFETY: the title's own arguments.
+        return unsafe { victory_bridge::virtual_query(address, out, size) };
+    }
     // SAFETY: the title's own arguments.
     unsafe { VirtualQuery(address, out, size) }
 }
@@ -2796,6 +3395,11 @@ extern "system" fn title_virtual_query(address: *const c_void, out: *mut MEMORY_
 extern "system" fn title_virtual_protect(address: *const c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
     use windows_sys::Win32::System::Memory::VirtualProtect;
     materialize_for(address as usize, size, Touch::TitleCall);
+    // The memory bridge's window: the bridge protects its views.
+    if victory_bridge::bridged(address as usize) {
+        // SAFETY: the title's own arguments.
+        return unsafe { victory_bridge::virtual_protect(address, size, protect, old) };
+    }
     // SAFETY: the title's own arguments.
     unsafe { VirtualProtect(address, size, protect, old) }
 }
@@ -2834,6 +3438,28 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// This thread's new physical pages and reservations go to the
+        /// memory bridge ([`bridge_on`], [`on_bridge`]).
+        pub(super) static BRIDGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Runs a test of the present path again on the memory bridge, its Unix
+    /// half emulated with Win32 calls (`victory_bridge::emulate`): what the
+    /// title sees must be the same.
+    fn on_bridge(test: impl FnOnce()) {
+        struct Off;
+        impl Drop for Off {
+            fn drop(&mut self) {
+                BRIDGE.set(false);
+            }
+        }
+        assert!(victory_bridge::emulate::install(), "the emulated bridge is the process's");
+        BRIDGE.set(true);
+        let _off = Off;
+        test();
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
@@ -3071,11 +3697,10 @@ mod tests {
         let lazy = |p: *mut c_void| LAZY.read().unwrap().contains_key(&(p as usize));
         // What the host has there, not asking the runtime (which maps lazy views).
         let host = |p: *mut c_void| {
-            use windows_sys::Win32::System::Memory::VirtualQuery;
             // SAFETY: plain data filled in by the query.
             let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
             // SAFETY: a valid out pointer of the right size.
-            unsafe { VirtualQuery(p, &mut info, size_of_val(&info)) };
+            unsafe { victory_bridge::virtual_query(p, &mut info, size_of_val(&info)) };
             info.State
         };
         // The bytes, through a view mapped at once.
@@ -3159,11 +3784,10 @@ mod tests {
         let lazy = |at: usize| LAZY.read().unwrap().contains_key(&at);
         // What the host has there, not asking the runtime.
         let host = |at: usize| {
-            use windows_sys::Win32::System::Memory::VirtualQuery;
             // SAFETY: plain data filled in by the query.
             let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
             // SAFETY: a valid out pointer of the right size.
-            unsafe { VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+            unsafe { victory_bridge::virtual_query(at as *const c_void, &mut info, size_of_val(&info)) };
             info.State
         };
         let read = |at: usize, len: usize| {
@@ -3498,8 +4122,8 @@ mod tests {
         assert_eq!(XMemMapPhysicalPagesScatter([at(0), at(1)].as_ptr(), 2, [pages[0], 1].as_ptr()), 0);
         // All gone, also parts of a larger view.
         assert_eq!(XMemMapPhysicalPages(at(0), 4, std::ptr::null()), at(0));
-        // SAFETY: placeholders of ours, nothing mapped in them.
-        unsafe { VirtualFree(at(0), 4 * PAGE, MEM_RELEASE | 1 /* MEM_COALESCE_PLACEHOLDERS */) };
+        // Placeholders of ours, nothing mapped in them (as the title would).
+        title_virtual_free(at(0), 4 * PAGE, MEM_RELEASE | 1 /* MEM_COALESCE_PLACEHOLDERS */);
         assert_eq!(XMemMapPhysicalPages(at(0), 4, pages.as_ptr()), at(0));
         assert!(map_aliases(&[(a as u64, 0, (2 * N * PAGE) as u64)]));
         assert!((0..2 * N).all(|k| query(at(k)).host.State == MEM_RESERVE));
@@ -3537,10 +4161,8 @@ mod tests {
             }
             // The title joins what it unmapped: the next view splits it anew.
             if round == 3 {
-                // SAFETY: placeholders of ours, nothing mapped in them.
-                unsafe {
-                    VirtualFree(a, 8 * PAGE, MEM_RELEASE | 1 /* MEM_COALESCE_PLACEHOLDERS */)
-                };
+                // Placeholders of ours, nothing mapped in them.
+                title_virtual_free(a, 8 * PAGE, MEM_RELEASE | 1 /* MEM_COALESCE_PLACEHOLDERS */);
             }
         }
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
@@ -3767,6 +4389,201 @@ mod tests {
         assert!(busy_after(true, ms(15), ms(250)) && !busy_after(true, ms(12), ms(250)));
         // A window without a call, then one short one.
         assert!(!busy_after(true, ms(5), ms(4000)));
+    }
+
+    #[test]
+    fn the_32_bit_heap_gets_its_slices_in_address_order_on_the_bridge() {
+        on_bridge(the_32_bit_heap_gets_its_slices_in_address_order);
+    }
+
+    #[test]
+    fn physical_pages_map_alias_and_unmap_on_the_bridge() {
+        on_bridge(physical_pages_map_alias_and_unmap);
+    }
+
+    #[test]
+    fn lazy_views_are_mapped_when_touched_on_the_bridge() {
+        on_bridge(lazy_views_are_mapped_when_touched);
+    }
+
+    #[test]
+    fn views_in_the_books_alone_are_read_from_their_pages_on_the_bridge() {
+        on_bridge(views_in_the_books_alone_are_read_from_their_pages);
+    }
+
+    #[test]
+    fn a_reader_in_place_faults_into_a_lazy_view_while_a_mapping_waits_on_the_bridge() {
+        on_bridge(a_reader_in_place_faults_into_a_lazy_view_while_a_mapping_waits);
+    }
+
+    #[test]
+    fn a_copy_of_consecutive_pages_shows_them_through_one_view_on_the_bridge() {
+        on_bridge(a_copy_of_consecutive_pages_shows_them_through_one_view);
+    }
+
+    #[test]
+    fn a_read_in_place_never_meets_the_gap_of_a_remapping_on_the_bridge() {
+        on_bridge(a_read_in_place_never_meets_the_gap_of_a_remapping);
+    }
+
+    #[test]
+    fn a_title_thread_goes_on_using_the_rest_of_a_view_on_the_bridge() {
+        on_bridge(a_title_thread_goes_on_using_the_rest_of_a_view);
+    }
+
+    #[test]
+    fn a_scatter_of_many_pages_is_what_one_after_the_other_is_on_the_bridge() {
+        on_bridge(a_scatter_of_many_pages_is_what_one_after_the_other_is);
+    }
+
+    #[test]
+    fn pages_mapped_again_hold_what_they_held_on_the_bridge() {
+        on_bridge(pages_mapped_again_hold_what_they_held);
+    }
+
+    #[test]
+    fn mapping_no_pages_changes_nothing_on_the_bridge() {
+        on_bridge(mapping_no_pages_changes_nothing);
+    }
+
+    #[test]
+    fn runs_group_consecutive_pages_of_one_allocation_on_the_bridge() {
+        on_bridge(runs_group_consecutive_pages_of_one_allocation);
+    }
+
+    #[test]
+    fn writes_cross_runs_and_allocations_on_the_bridge() {
+        on_bridge(writes_cross_runs_and_allocations);
+    }
+
+    #[test]
+    fn pages_say_where_they_are_mapped_on_the_bridge() {
+        on_bridge(pages_say_where_they_are_mapped);
+    }
+
+    #[test]
+    fn page_windows_cover_one_run_in_place_on_the_bridge() {
+        on_bridge(page_windows_cover_one_run_in_place);
+    }
+
+    #[test]
+    fn ranges_less_others() {
+        assert_eq!(minus(&[(0, 10)], &[]), [(0, 10)]);
+        assert_eq!(minus(&[(0, 10), (20, 5)], &[(2, 3), (8, 14)]), [(0, 2), (5, 3), (22, 3)]);
+        assert_eq!(minus(&[(4, 4)], &[(0, 4), (4, 4), (8, 4)]), []);
+        assert_eq!(minus(&[(4, 8)], &[(6, 2), (0, 5)]), [(5, 1), (8, 4)]);
+    }
+
+    /// A reservation of 64 KiB pages on the bridge is its window: Windows
+    /// has a plain reservation there, which the bridge maps in; the title's
+    /// cuts and joins are nothing to do, a commit is refused, and releasing
+    /// it unmaps what it shows (books and notices as for an unmapping) and
+    /// gives it back to Windows.
+    #[test]
+    fn a_reservation_on_the_bridge_is_its_window_until_released() {
+        on_bridge(|| {
+            let pages = allocate(2);
+            let a = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+            assert!(!a.is_null());
+            let at = |k: usize| a.wrapping_byte_add(k * PAGE);
+            assert!(victory_bridge::bridged(a as usize) && victory_bridge::bridged(at(4) as usize - 1));
+            assert!(!victory_bridge::bridged(at(4) as usize));
+            assert_eq!(victory_bridge::query(a as usize).map(|r| r.window), Some((a as usize, 4 * PAGE)));
+            assert_eq!(query(a).host.State, MEM_RESERVE);
+            // The title cuts its reservation and joins it again: nothing.
+            assert_eq!(title_virtual_free(at(1), PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER), 1);
+            assert_eq!(XMemVirtualAlloc(at(1), PAGE, MEM_RESERVE | MEM_REPLACE_PLACEHOLDER | PAGES_64K, 0, PAGE_NOACCESS), at(1));
+            assert_eq!(title_virtual_free(a, 4 * PAGE, MEM_RELEASE | 1 /* MEM_COALESCE_PLACEHOLDERS */), 1);
+            // A commit there never reaches Windows.
+            assert!(XMemVirtualAlloc(at(1), PAGE, MEM_COMMIT, 0, PAGE_READWRITE).is_null());
+            assert_eq!(title_virtual_free(at(1), PAGE, windows_sys::Win32::System::Memory::MEM_DECOMMIT), 0);
+            assert_eq!(XMemMapPhysicalPages(at(1), 2, pages.as_ptr()), at(1));
+            // SAFETY: mapped read-write.
+            unsafe { at(2).cast::<u8>().write(3) };
+            assert_eq!(query(at(2)).host.State, MEM_COMMIT);
+            assert_eq!(pages_shown(&pages, 0, 2 * PAGE), [(at(1) as usize, PAGE), (at(2) as usize, PAGE)]);
+            // Released: its views go, and so does the window.
+            assert_ne!(title_virtual_free(a, 0, MEM_RELEASE), 0);
+            assert!(!victory_bridge::bridged(a as usize));
+            assert!(physical().views.range(a as usize..at(4) as usize).next().is_none());
+            assert!(pages_shown(&pages, 0, 2 * PAGE).is_empty());
+            assert_eq!(query(a).host.State, windows_sys::Win32::System::Memory::MEM_FREE);
+            // The pages keep their bytes.
+            assert_eq!(page_bytes(pages[1])[0], 3);
+            assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        });
+    }
+
+    /// Pages of a section of the host's in a list mapped on the bridge: the
+    /// bridge refuses them alone; the rest of the list is mapped, each page
+    /// with what the bridge said of it, and what they replaced is gone.
+    #[test]
+    fn a_list_on_the_bridge_keeps_each_pages_result() {
+        // A section of the host's, made off the bridge.
+        let host = allocate(1);
+        on_bridge(|| {
+            let pages = allocate(3);
+            let a = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+            let at = |k: usize| (a + k * PAGE) as *mut c_void;
+            assert_eq!(XMemMapPhysicalPages(at(0), 3, pages.as_ptr()), at(0));
+            // SAFETY: mapped read-write.
+            unsafe { at(0).cast::<u8>().write(1) };
+            // Page 2 where page 0 was, the host's page in the middle of the
+            // view, and page 0 at the end.
+            assert!(!scatter(&[(at(0) as usize, pages[2]), (at(1) as usize, host[0]), (at(3) as usize, pages[0])]));
+            let views = |k: usize| physical().views.get(&(at(k) as usize)).map(|v| (v.0, v.1.index));
+            assert_eq!([views(0), views(1), views(2), views(3)], [Some((PAGE, 2)), None, Some((PAGE, 2)), Some((PAGE, 0))]);
+            assert_eq!(query(at(1)).host.State, MEM_RESERVE);
+            // SAFETY: mapped read-write.
+            unsafe {
+                assert_eq!(at(3).cast::<u8>().read(), 1);
+                at(0).cast::<u8>().write(9);
+                assert_eq!(at(2).cast::<u8>().read(), 9);
+            }
+            // The bridge sees one pool page at two addresses.
+            let shows = |k: usize| victory_bridge::query(at(k) as usize).map(|r| r.kind);
+            assert_eq!(shows(0), shows(2));
+            assert_ne!(shows(0), shows(3));
+            assert_eq!(XMemMapPhysicalPages(at(0), 4, std::ptr::null()), at(0));
+            assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        });
+        assert_eq!(XMemFreePhysicalPages(1, host.as_ptr()), 1);
+    }
+
+    /// The GPU's page-mapping copies on the bridge: each address shows the
+    /// pool page its source shows (the bridge says so too), writes through
+    /// one are seen at the other, a copy of an unmapped source fails and
+    /// unmaps, and a copy of nothing unmaps.
+    #[test]
+    fn page_mapping_copies_on_the_bridge_are_aliases_of_the_pool() {
+        on_bridge(|| {
+            let pages = allocate(4);
+            let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE) as usize;
+            let (pool, heap) = (reserve(), reserve());
+            assert_eq!(XMemMapPhysicalPages(pool as *mut c_void, 4, pages.as_ptr()) as usize, pool);
+            // Out of order, in one call, as the GPU's copies come.
+            assert!(map_aliases(&[(heap as u64, (pool + 2 * PAGE) as u64, PAGE as u64), ((heap + PAGE) as u64, pool as u64, 2 * PAGE as u64)]));
+            let shows = |at: usize| victory_bridge::query(at).map(|r| r.kind);
+            for (to, from) in [(heap, pool + 2 * PAGE), (heap + PAGE, pool), (heap + 2 * PAGE, pool + PAGE)] {
+                assert_eq!(shows(to), shows(from));
+                // SAFETY: both mapped read-write.
+                unsafe {
+                    (from as *mut u8).write(to as u8 | 1);
+                    assert_eq!((to as *const u8).read(), to as u8 | 1);
+                }
+            }
+            let mut both = [(heap, PAGE), (pool + 2 * PAGE, PAGE)];
+            both.sort_unstable();
+            assert_eq!(shown_at(&pages[2..3], 0, PAGE), both);
+            // The source unmapped: the copy fails and leaves nothing there.
+            assert_eq!(XMemMapPhysicalPages((pool + 3 * PAGE) as *mut c_void, 1, std::ptr::null()) as usize, pool + 3 * PAGE);
+            assert!(!map_alias(heap as u64, (pool + 3 * PAGE) as u64, PAGE as u64));
+            assert_eq!(victory_bridge::query(heap).map(|r| r.kind), Some(victory_bridge::Kind::Unmapped));
+            assert!(map_alias((heap + PAGE) as u64, 0, 3 * PAGE as u64));
+            assert!(physical().views.range(heap..heap + 4 * PAGE).next().is_none());
+            assert_eq!(XMemMapPhysicalPages(pool as *mut c_void, 4, std::ptr::null()) as usize, pool);
+            assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        });
     }
 
     #[test]

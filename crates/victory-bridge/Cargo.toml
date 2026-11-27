@@ -13,10 +13,16 @@ tracing.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Security",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Threading",
 ] }
+
+[features]
+# `victory_bridge::emulate`: the Unix half emulated with Win32 calls, for
+# other crates' tests (never in a build that ships).
+emulate = []
 
 [lints]
 workspace = true

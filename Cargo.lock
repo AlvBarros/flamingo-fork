@@ -702,6 +702,7 @@ dependencies = [
  "opus-pure",
  "tempfile",
  "tracing",
+ "victory-bridge",
  "victory-formats",
  "victory-gpu",
  "victory-loader",

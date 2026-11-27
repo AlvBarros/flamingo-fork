@@ -1123,3 +1123,158 @@ Proposal, not implemented (none is trivially behaviour-preserving off the bridge
   log (cheap, but counted): after WS3 the count stays and the time falls.
 - Not verified: anything in a game run (none by this workstream), and the bridged branch against a
   real Unix half (tested against a fake only; WS1/WS2 are not merged here).
+
+### WS3 results (foxhound base)
+
+Done 2026-11-27 on `memory-bridge-foxhound-ws3`. xmem maps the title's physical pages through
+the bridge when `victory_bridge::available()`. Without it (`VICTORY_BRIDGE` unset or `0`, no DLL,
+Windows), every bridged branch sits behind `victory_bridge::bridged(addr)` or `bridge_on()`, both
+false, and the present code runs unchanged. Not run in the game; the real DLL is WS1+WS2's.
+
+**Emulated Unix half for tests** (`crates/victory-bridge/src/emulate.rs`, feature `emulate`,
+Windows only; `victory-hle` turns it on in its dev-dependencies only). An `Entry` speaking the ABI
+with Win32 calls:
+- a pool is a pagefile section (`SEC_COMMIT`); its id is the handle;
+- `WINDOW_ADD` releases the plain reservation and reserves it again as a placeholder (another
+  thread's allocation could take the address in between; acceptable in tests); `WINDOW_REMOVE`
+  unmaps, joins and hands back a plain reservation;
+- a view is one `MapViewOfFile3` per 64 KiB over a placeholder cut to that size, so any part of a
+  view can be replaced or unmapped alone; `MAP` over a view replaces it;
+- `PROTECT` is `VirtualProtect`; features 0 (no watch, no copy).
+
+`victory_bridge::emulate::install()` makes it the process's bridge whatever `VICTORY_BRIDGE` says,
+through a small hook in `lib.rs` (`INSTALLED`, checked before the loaded bridge, set by
+`install(entry)`). The crate's own test of it runs on a private `Bridge`, because the crate's other
+tests need none installed. Views must be 64 KiB-aligned there; xmem's always are.
+
+**Design decisions.**
+- *Which path.* Decided per object, not per call. A pool is the bridge's if made while
+  `bridge_on()`: a `Section` with `pool: Some(victory_bridge::Pool)` and a null `handle`. A
+  reservation is a window if made while `bridge_on()`. Every later operation asks
+  `victory_bridge::bridged(addr)`. In tests `bridge_on()` is also gated by a thread-local, so both
+  paths run in one process.
+- *The GPU side's number for a section.* A bridged pool has no handle; `Section::id()` returns
+  `1<<62 | pool id` (no handle has that bit), and that is what `title_memory_view` gets.
+  `title_memory_section` and `title_memory_section_gone` are **not** called for bridged pools.
+  `inplace` uses that registration only to open the section (`OpenExistingHeapFromFileMapping`,
+  impossible on a memfd: S3) and to map a view of its own (`beside`, `MapViewOfFile` on the handle).
+  So `inplace::beside`/`beside_page` answer `None` for bridged views, and in place never takes the
+  section path there (S3: only `OpenExistingHeapFromAddress1`).
+- *xmem's own view of a whole pool* (`Section::window`, used by DirectStorage writes,
+  `write_physical`, `page_window`, `soft_read`). For a bridged pool it is a reservation of its own,
+  handed to the bridge, with the pool mapped there in one `MAP`. It is made on first use as before,
+  and always, even with `VICTORY_SECTION_WINDOW=0`, because a pool has no `MapViewOfFile`.
+  `View::map` returns a borrowed piece of it (holding the section). Bridged pools get no commits:
+  `commit`/`commit_shown` skip the call but still keep the commit bits for `arrange`.
+- *One call per batch, on the calling thread.* Every change of mapping goes in three steps:
+  1. The books first (`unmap_bridged`): views and `Shown` forgotten, `title_memory_splitting` and
+     `_unmapping` told as before. What stays of a cut view is noted again with
+     `title_memory_remapped`/`_view` but makes **no** bridge call, since the bridge unmaps only the
+     part inside. It returns the ranges the bridge still shows.
+  2. One `Pool::map` per pool for all new views. `MAP` replaces what is there: no unmap first, no
+     placeholder split.
+  3. One `unmap` for the old ranges that no new view covers (`minus`).
+
+  The new views are then noted and told, in that order. Per-op results come back and decide what
+  is noted: a refused op is not noted and makes the call fail.
+- *Reservations.* `XMemVirtualAlloc` of 64 KiB pages becomes a plain `MEM_RESERVE` (no
+  `MEM_WRITE_WATCH`) followed by `window_add`; so does the title's own `MEM_RESERVE_PLACEHOLDER`
+  kind (the 32-bit heap). If the bridge refuses the window, the reservation is released and null
+  returned. Inside a window, a `MEM_REPLACE_PLACEHOLDER` or reserve at a base is "nothing to do"
+  (base returned), and `MEM_COMMIT` is refused (S2), as it fails in a placeholder.
+- *Release* (`title_virtual_free` in a window: `bridged_free`):
+  - the split and join flags (`MEM_PRESERVE_PLACEHOLDER`, `MEM_COALESCE_PLACEHOLDERS`) are
+    bookkeeping only and return 1;
+  - `MEM_DECOMMIT` fails with `ERROR_INVALID_ADDRESS`;
+  - `MEM_RELEASE` of the window's base: `title_memory_freed`, the window's views unmapped through
+    the books (notices as for an unmapping), `window_remove`, then Wine's `VirtualFree(MEM_RELEASE)`;
+  - `MEM_RELEASE` of a piece the title cut out: unmapped, and it stays reserved until the whole
+    window goes (shortcut).
+- *Counting.* `bridge_call` adds to two new frame-log totals, `RemapBridgeCalls` and
+  `RemapBridgeNs`. The line's xmem section now reads `xmem: <n> mapping calls <ms> ms; Windows
+  calls <n> <ms> ms; bridge calls <n> <ms> ms; the GPU side told ...` (`framelog.rs`: two `T`s, the
+  line, its test). `Costed` (xmem mapping calls) and `told` are unchanged; creating a pool counts as
+  a bridge call too. `ab_runs.py` (WS8's file) does not read the new column yet; the regexes would
+  be `bridge calls {N} ` and `bridge calls -?[0-9.]+ {N} ms`.
+
+**Per function.**
+
+| Function | Bridged |
+|---|---|
+| `XMemAllocatePhysicalPages` | `allocate_bridged`: `Pool::create`; page numbering shared with the present path (`give_pages`) |
+| `Section::window` / `View::map` / `Drop` | its own window + one `MAP` / a borrowed piece of it / `window_remove` + `VirtualFree` |
+| `XMemVirtualAlloc` | windows as above; a commit inside one refused |
+| `XMemVirtualQuery`, `title_virtual_query`, `title_virtual_protect` | `victory_bridge::virtual_query`/`virtual_protect` for bridged addresses |
+| `title_virtual_free` | `bridged_free` |
+| `map_pages` (`XMemMapPhysicalPages`) | `map_pages_bridged`: the books, one `MAP` per pool for all runs (or `map_lazy` with soft views), one unmap; all runs are tried, and an unknown page stops there as before |
+| `XMemMapPhysicalPagesScatter` / `scatter` | batched through `change` whenever the first address is bridged (not only with `VICTORY_MAP_THREADS` > 1), unless the pool's views are soft |
+| `map_aliases` | batched through `change` when bridged, unless the copies' views are soft |
+| `map_alias` / `alias_as` | `alias_bridged`: a piece per run (`VICTORY_MAP_RUNS=1`) or per page, one `MAP` + one unmap; overlapping ranges and `from == 0` as before (a bridge call per page, or an unmap) |
+| `change` | `change_bridged`: the same books per page, one `MAP` per pool, one unmap. No worker pool (`pool::all` runs only on the present path), so `VICTORY_MAP_THREADS` does not matter on the bridge |
+| `unmap` | `unmap_bridged` + one unmap, of only the overlapped part of a cut view (the rest stays mapped) |
+| `show`/`show_as` (also `materialize_for`) | one `MAP` |
+| `split`, `one_placeholder`, `one_placeholder_there`, `Op::run`, `commit` | never reached for bridged memory |
+| `map_lazy` | no split or placeholder check in a window (the caller unmapped what was there) |
+
+**Soft views** (`VICTORY_SOFT_VIEWS`) work on both paths. On the bridge, a view kept in the books
+alone is unmapped (`PROT_NONE`), faults as before, and is "made real" by one bridge `MAP`
+(`materialize_for` -> `show`); `soft_read` reads through the bridged pool's own view.
+
+Whether making views real stays worth it: soft views avoid Wine's 45 + 93 µs per view, and a view
+on the bridge costs ~1 µs (S4). What they still cost there is a fault, the handler and a map per
+view touched, the GPU side's reads through `soft_read`, and the long frames' "made real" bursts. So
+on the bridge they likely stop paying. **A/B `VICTORY_SOFT_VIEWS` unset against `copies` with
+`VICTORY_BRIDGE=1`** (WS8) before keeping them. With them off, `map_aliases` and scatter take the
+batched path (one call per group). Nothing here turns them off automatically.
+
+**Tests** (`FORK_FEATURES="" scripts/linux/test.sh`, under Proton, this machine).
+- **xmem.** 15 existing mapping tests get a twin `<name>_on_the_bridge`: `on_bridge(<name>)` runs
+  the same body with the emulated bridge installed and the thread's new pools and reservations on
+  it. Four new tests:
+  - `ranges_less_others`;
+  - `a_reservation_on_the_bridge_is_its_window_until_released`: window add and remove, and the
+    title's split, join, commit, decommit and release;
+  - `a_list_on_the_bridge_keeps_each_pages_result`: a scatter batch's per-op results. One page is
+    refused and the others are mapped; the old view is cut, and unmapped only where nothing new is;
+  - `page_mapping_copies_on_the_bridge_are_aliases_of_the_pool`: `map_aliases`/`map_alias` on the
+    bridge, whose map shows the same pool page at alias and source.
+
+  Two existing tests changed slightly to run on both paths. The title's join of placeholders now
+  goes through `title_virtual_free` (it was a raw `VirtualFree`; same effect on the present path).
+  "What the host has" now asks `victory_bridge::virtual_query`, which is Wine's answer for
+  memory that is not bridged.
+- **`victory-hle` lib.** Base 63edacb, built the same way, one thread: 169 passed, 2 failed
+  (`net::tests::only_loopback_is_reachable`, `xgamesave::tests::a_kept_blob_past_the_link_limit_is_copied`).
+  With WS3: 188 passed (19 new), the same 2 failed. Three more runs with parallel threads gave the
+  same result.
+- **`victory-bridge`.** 21 passed (20 + the emulator's).
+- **`victory-gpu` lib.** One thread, the four process-killing tests skipped as in WS8: 414 passed,
+  7 failed. The failures are WS8's 4 base failures (`watch::many_askers_tests::*` x3,
+  `watch::tests::what_is_left_alone_is_no_known_hole`) and its 3 machine-state ones. Framelog's 9
+  tests pass.
+- **Checks.** `cargo xtask policy` passes. `cargo xwin clippy --tests` gives no warnings in the
+  changed code; the three in xmem's tests are in old lines. `emulate.rs`, the bridge's `lib.rs` and
+  `framelog.rs` are rustfmt-clean. xmem.rs was not rustfmt-clean before (100 diffs) and is not
+  reformatted.
+
+**Open issues.**
+- **WS4.** `title_virtual_query`/`title_virtual_protect` (xmem's hooks of the title's imports) now
+  ask the bridge for bridged addresses, but they are bound only with `VICTORY_SOFT_VIEWS`. With the
+  bridge they should be bound always, or WS4's loader-level wrappers should replace them (do not
+  bind two `VirtualQuery` hooks). `title_virtual_free` is always bound and handles windows here.
+  Our own `VirtualQuery` sites on title memory (watch.rs and others) still ask Wine.
+- **WS5.** `MAP_WATCH` is false everywhere; the one place to set it is the `MapOp` built in
+  `bridge_map` (and in `Section::bridge_window`, which needs none). For aliases, `Shown` (pool page
+  -> addresses) is what fans writes out.
+- **WS6/WS7.**
+  - `inplace::beside` answers `None` for bridged views, because no section is registered. If the
+    GPU side wants a view beside the title's for bridged pools, xmem has one per pool
+    (`Section::window`); a notice handing it over (`id`, base) would do.
+  - S3's rule 1 (drop or re-open a heap before remapping under it) is not done here.
+    `title_memory_unmapping`/`_splitting` are still told before every bridge unmap or replace, and
+    they are the hook for it.
+- **Behaviour differences on the bridge.** A `MAP` op the bridge refuses no longer stops the
+  following runs of the same call: they are mapped and noted, and the call still returns failure.
+  The title's release of a piece of a window keeps it reserved until the whole is released.
+- **Not verified.** Anything against the real Unix half and DLL (emulator only); the bridge's speed
+  in xmem's shape (batch sizes per frame); a game run.
