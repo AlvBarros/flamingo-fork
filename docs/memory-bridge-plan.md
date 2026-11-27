@@ -610,6 +610,21 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
 - 2026-11-27 (this session): **run announced** — e8f663f, **`VICTORY_BRIDGE=1`** (first game run on the bridge), otherwise as the 13:39 run; 5 min unattended (short runs from now on).
   Done 14:18-14:24: `memory bridge on (VICTORY_BRIDGE) features=3`, no crash.
 
+- 2026-11-27 18:47 (another session): an A/B meant as bridge off vs on, 10 min each, prefix
+  `flamingo-fork-foxhound`. **Both runs had the bridge on**: `scripts/linux/play.local.env` in this
+  folder sets `VICTORY_BRIDGE=1`, and unsetting it in the environment does not override the file
+  (the log header says which applies). **The PC froze**: when the first run was ended with
+  `wineserver -k` (18:57:33), the card reported `Xid 31` (MMU fault, `title-main`) in the same
+  second, and NVIDIA's driver then spun in its cleanup of the dying process
+  (`nvidia_close -> ... intermapDelDmaMapping -> btreeUnlink`, soft lockup on one CPU for 17+
+  minutes, thread `vkd3d_fence`), which held the GPU: black screen, no input, a hard reboot.
+  Xid 31 at a forced close happened often before the bridge (2026-11-25/26) without a lockup; the
+  lockup in the DMA-mapping teardown is new, so the bridge's memfd-backed title views are suspect
+  (not proven: one occurrence). **Until understood:** no `wineserver -k` on a bridge run while the
+  card is busy (end runs gracefully), and the bridge stays off by default. To find out: which title
+  pages the GPU has DMA-mapped (vkd3d host-pointer imports, `OpenExistingHeapFromAddress1`, upload
+  heaps over title memory) and whether a bridge view is unmapped or its memfd closed while they stand.
+
 ### Re-scope
 
 - The last two logs that ran this base (`b190242`, 2026-11-27 09:20 and 09:30) ran **without**
