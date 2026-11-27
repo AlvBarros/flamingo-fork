@@ -91,6 +91,46 @@ def note_before(notes, t):
     return f'{int(t - best[0])} s after "{best[1]}"' if best else ""
 
 
+def mango(session, notes):
+    """MangoHud's recording (every frame's time), if there is one."""
+    import glob, os
+    files = sorted(glob.glob(f"{session}/*.csv"))
+    files = [f for f in files if not f.endswith("/gpu.csv")]
+    if not files:
+        print("\nMangoHud: no recording (not installed, FORK_MANGOHUD=0, or the session ended before it wrote)")
+        return
+    rows = list(csv.reader(open(files[-1])))
+    head = next((i for i, r in enumerate(rows) if r and r[0] == "fps"), None)
+    if head is None:
+        print(f"\nMangoHud: {os.path.basename(files[-1])} has no frame rows")
+        return
+    cols = rows[head]
+    try:
+        ft, el = cols.index("frametime"), cols.index("elapsed")
+        frames = [(float(r[el]) / 1e9, float(r[ft])) for r in rows[head + 1:] if len(r) == len(cols)]
+    except (ValueError, IndexError):
+        print("\nMangoHud: columns not understood")
+        return
+    if not frames:
+        print("\nMangoHud: no frames")
+        return
+    ms = [f for _, f in frames]
+    start = os.path.getmtime(files[-1]) - frames[-1][0]  # when its logging began, roughly
+    print(f"\nMangoHud (every frame, as the screen saw it): {len(ms)} frames, median {st.median(ms):.0f} ms, "
+          f"p99 {pct(ms, .99):.0f} ms, longest {max(ms):.0f} ms, over 100 ms {sum(f > 100 for f in ms)}, "
+          f"over 250 ms {sum(f > 250 for f in ms)}")
+    print("  per minute: " + "  ".join(
+        f"{hm(start + k * 60)} {st.median(v):.0f}/{max(v):.0f}"
+        for k, v in sorted(_by_minute(frames).items())) + "   (median/longest ms)")
+
+
+def _by_minute(frames):
+    out = {}
+    for t, f in frames:
+        out.setdefault(int(t // 60), []).append(f)
+    return out
+
+
 def main():
     session, log = sys.argv[1], sys.argv[2]
     frames, longs, bridge, crashes = read_log(log)
@@ -139,6 +179,7 @@ def main():
             else:
                 print(f"  {hm(at)} {text!r}: no frames logged")
 
+    mango(session, notes)
     try:
         rows = list(csv.reader(open(f"{session}/gpu.csv")))[1:]
         util = [float(r[1]) for r in rows]

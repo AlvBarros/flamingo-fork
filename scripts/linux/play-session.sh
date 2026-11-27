@@ -6,8 +6,9 @@
 #
 # Settings come as for run.sh (play.env, then play.local.env, then the
 # environment), except that the scripted key presses (FORK_KEYS) are off: you
-# play. Alongside the game it records the GPU (nvidia-smi, once a second) and
-# the system (vmstat: swap, disk wait), in logs/session-<time>/.
+# play. Alongside the game it records the GPU (nvidia-smi, once a second), the
+# system (vmstat: swap, disk wait) and, with MangoHud installed, every frame's
+# time (with an overlay on screen), in logs/session-<time>/.
 #
 # While it runs, type a note and press Enter ("prison starts", "big stutter",
 # "Lucia has no head"): it is stamped with the time and shown beside the long
@@ -43,6 +44,16 @@ nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,
 GPU=$!
 vmstat -w -t 1 > "$S/vmstat.txt" 2>/dev/null &
 VM=$!
+
+# MangoHud (if installed; FORK_MANGOHUD=0 leaves it off): an overlay with fps,
+# frame times and the GPU, and every frame's time recorded into the session.
+# It writes its recording when its logging stops, so that stops 20 s before
+# the limit (a session ended early with q may lose it).
+if [ "${FORK_MANGOHUD:-1}" != 0 ] && command -v mangohud >/dev/null; then
+    export MANGOHUD=1
+    export MANGOHUD_CONFIG="${MANGOHUD_CONFIG:-fps,frametime,frame_timing=1,gpu_stats,vram,cpu_stats,ram,position=top-left,output_folder=$ROOT/$S,autostart_log=5,log_interval=0,log_duration=$((MIN * 60 - 20))}"
+    echo "MangoHud: overlay on, frames recorded into $S (FORK_MANGOHUD=0 turns it off)"
+fi
 
 before=$(ls -t logs/*play.log 2>/dev/null | head -1)
 FORK_KEYS= scripts/linux/run.sh play > "$S/run.out" 2>&1 &
@@ -88,4 +99,4 @@ sleep 3
 kill "$GPU" "$VM" 2>/dev/null
 wait 2>/dev/null
 python3 -I scripts/linux/session_report.py "$S" "$LOG" | tee "$S/report.txt"
-echo "Everything is in $S (report.txt, notes.txt, gpu.csv, vmstat.txt) and $LOG"
+echo "Everything is in $S (report.txt, notes.txt, gpu.csv, vmstat.txt, MangoHud's .csv) and $LOG"
