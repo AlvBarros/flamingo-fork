@@ -845,3 +845,115 @@ preset one).
 - `WINEDLLPATH` names `victory.exe`'s directory (`target/.../release`), so Wine would also take
   any other builtin-marked DLL placed there as builtin; nothing else there is one today.
 - Not tried with the real Unix half (WS1) or in a game run.
+
+### WS1 results (foxhound base)
+
+Done 2026-11-27 on `memory-bridge-foxhound-ws1`. `bridge/unix/victorybridge_unix.c` (C, gcc
+`-shared -fPIC`, `-Werror`) exports `__wine_unix_call_funcs[VB_CALLS]` with the semantics of
+`abi.rs`; ABI unchanged. `bridge/unix/README.md` lists what it does beyond the ABI's text.
+`bridge/unix/build.sh` builds `target/bridge/victorybridge.so` and the native test
+`target/bridge/test_unix` (no Wine: `dlopen`s the `.so` and calls the table);
+`bridge/unix/proton/run.sh` checks it under Proton with a test-only PE half.
+
+**Built.**
+- Pools: memfd (`MFD_CLOEXEC | MFD_EXEC`, falling back without `MFD_EXEC`). Ids are
+  `generation << 32 | slot + 1`: nonzero, and a destroyed id is never valid again.
+- Windows: a table; overlaps refused. `WINDOW_REMOVE` needs the exact `(addr, len)` and first
+  maps the whole window back to PROT_NONE anonymous.
+- `MAP`: one `MAP_FIXED | MAP_SHARED` mmap per op, then, with `VB_MAP_WATCH`,
+  `UFFDIO_REGISTER(WP)` + `UFFDIO_WRITEPROTECT`. `UNMAP`: PROT_NONE anonymous (`MAP_NORESERVE`).
+  `PROTECT`: `mprotect`.
+- `WATCH_TAKE`: `PAGEMAP_SCAN` with `PM_SCAN_WP_MATCHING`, category `PAGE_IS_WRITTEN`,
+  `max_pages = capacity`, never `PM_SCAN_CHECK_WPASYNC`.
+- `COPY`: `process_vm_readv` on our own pid.
+- uffd: `UFFD_USER_MODE_ONLY`, `WP_ASYNC | WP_UNPOPULATED | WP_HUGETLBFS_SHMEM`.
+  `VB_FEATURE_WATCH` is set only after a self-test at the first call: a one-page memfd view is
+  registered, armed and written, and must be found by one scan and not by the next.
+- Threads: no lock on the hot paths (pool and window lookups read atomics). One mutex covers pool
+  create/destroy and window add/remove, held over table updates only. Every syscall is retried on
+  `EINTR` (the uffd ioctls on `EAGAIN` too).
+
+**Tests** (`RUN=1 bridge/unix/build.sh`): 163 checks, all pass natively and under UBSan. A
+mutation (no `max_pages`) makes 7 fail. Covered:
+- Version and features; pool ids, slot reuse, double destroy; window add, overlap, remove.
+- Views: aliases see each other's writes. Unmap leaves PROT_NONE anonymous memory, still in
+  `/proc/self/maps`, with the pool's bytes kept. A map over a view replaces it.
+- Protect: a write to a read-only view faults, a read of PROT_NONE faults, one page of a view
+  can be protected, unknown bits are refused.
+- A destroyed pool's views stay and still alias; its id maps nothing. Window removal empties the
+  window.
+- Batches: per-op results for ops outside a window, straddling its end, with an unaligned address
+  or offset, past the pool, or with an unknown flag (a sentinel page outside the window stays
+  untouched); `done`; `count` 0, 4,096 and 4,097; an unknown pool.
+- Watch: exactly the written pages (reads not counted, unpopulated pages counted), re-armed after
+  a take, aliases reported only where written, sub-ranges. Capacities 1, 4, 13 and 40 paged through `more`
+  lose or double nothing and leave no page armed. A page at the range's very end. A remap starts
+  clean with its data kept; an unwatched remap reports nothing; a hole of unmapped views is
+  skipped; protect R then RW keeps tracking.
+- Copy: whole; across an unmapped view (stops at it); from PROT_NONE; into PROT_NONE, read-only,
+  or a destination that ends early; from address 8. None of them faults.
+- **EINTR**: 300 rounds of 256-op map/take/protect/copy/unmap batches on a thread flooded with a
+  signal installed without `SA_RESTART` (1-18 million signals per run): no op failed and every
+  take was exact.
+- Threads: 6 threads map and take at once while pools and windows are created and removed 2,000
+  times.
+
+Under **Proton Experimental** (own prefix, `WINEDLLPATH`), the `.so` loads and `VERSION` answers
+1 with features 3 (watch, copy). A round trip from PE code through a `VirtualAlloc(MEM_RESERVE)`
+window passes: aliases, a PE write found by one take and then re-armed, a copy stopping at an
+unmapped view, window removal, and Wine then releasing the reservation.
+
+**Speed** (`SPEED=1`). Setup: 60,000 views of 64 KiB (3.66 GiB) over a 512 MiB pool, view i at
+offset (i % 8192) × 64 KiB as in S1, batches of 4,096, P-cores, native. Two runs on a machine
+shared with other sessions (load 3-5).
+
+| Per op, 60,000 views | WS1 | S1 / S4 |
+|---|---|---|
+| map into unmapped | 0.74-0.86 µs | 0.70-0.72 µs (S1 mmap) |
+| replace in place | 0.76-0.97 µs | 0.95-1.07 µs (S4) |
+| unmap | 0.72-0.86 µs | 0.84-0.87 µs (S1) |
+| map + `MAP_WATCH` into unmapped / replace in place + `MAP_WATCH` | 1.38-1.65 / 1.82-2.15 µs | 1.41 µs (S1, map+reg+arm) |
+| protect | 0.32-0.37 µs | 0.19-0.22 µs (S4, batched) |
+| churn: random view unmap + map (watched), 1 op per call | 3.3-4.8 µs | 3.03-3.27 µs (S1) |
+
+| Take of the whole window | right after mapping (8 VMAs) | after protect + churn (24,357 VMAs) | same, 8 other threads busy |
+|---|---|---|---|
+| nothing written | 1.4-1.8 ms | 3.9-7.0 ms | 6.6-8.8 ms |
+| 100 pages written | 1.3-1.8 ms | 3.5-7.5 ms | 6.7-9.0 ms |
+| 1 page in each of the 60,000 views | 2.3-3.2 ms | 18-25 ms | 57-110 ms |
+| all 16 pages of every 10th view (96,000 pages) | 2.9-3.5 ms | 11-14 ms | 23 ms |
+| one 64 KiB view, nothing written | 0.29-0.49 µs | 0.48-0.81 µs | 0.76-1.0 µs |
+
+Capacity per call (512, 4,096 or 200,000) and the size of the Unix half's region buffer (256 to
+65,536) make no measurable difference. The mapping numbers match S1/S4. Takes right after mapping
+match S1 (1.54 ms empty, 4.2 ms one page per view), but S1's contiguous offsets let the kernel
+merge its views into a few VMAs. **In the game every view is its own VMA** (random offsets,
+per-view protections). A take then costs about 50-100 ns per VMA walked, plus 0.3 µs per VMA
+with written pages, or 1-1.8 µs per such VMA when other threads of the process are running: the
+scan's re-arm flushes the TLB per VMA, and the flush sends IPIs to the CPUs those threads run on.
+
+**For the PE side and the ABI's users:**
+- **WS5:** take only the ranges the watch asks about, never the whole window every frame. A take
+  that finds many written views costs about 1 µs per view in a busy process. That is far below
+  today's guards, but it is not free.
+- **`victory-bridge` (lib.rs, `Bridge::map`):** a failed `MAP` op leaves its range *unmapped*,
+  not as it was. A `MAP_FIXED` mmap may already have dropped the old view, and a view whose
+  tracking could not be armed must not stay. `Bridge::map` records only the ops that succeeded,
+  so its map would keep showing the old view. It should record the failed ops it sent as
+  unmapped. This is a PE-side change; WS1 did not touch the crate.
+- `PROTECT` on an unmapped range succeeds and makes zero-filled private pages appear. Callers
+  must protect views only; `Bridge::protect` already checks this.
+- `WINDOW_REMOVE` needs the window's exact `(addr, len)`; `Bridge::window_remove` passes it.
+- `VB_MAP_WATCH` is silently ignored when `VB_FEATURE_WATCH` is off; `Bridge::map` sends it only
+  when the feature is on.
+- A take's `more` may cost one extra, empty call. If a scan fails after some pages were found,
+  they are returned with `more` set, and the next take is refused.
+
+**Not verified:**
+- A thread actually suspended by Wine (`SuspendThread`) in the middle of a batch. The EINTR test
+  uses plain signals, natively.
+- The Unix half in the game.
+- memfd hugepages.
+- `PAGEMAP_SCAN` racing an unmap of the same range from another thread. This can happen, because
+  the PE side serialises changes but not takes. The kernel takes `mmap_lock` for reading at each
+  2 MiB step, so at worst a take reports a page of a view that has just gone.
