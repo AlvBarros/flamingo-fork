@@ -686,6 +686,7 @@ dependencies = [
  "blake3",
  "tempfile",
  "tracing",
+ "victory-bridge",
  "victory-formats",
  "victory-pipeline",
  "victory-shader",

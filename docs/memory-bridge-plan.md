@@ -762,3 +762,169 @@ one thread, against the base b3fc71c built the same way:
   clippy warnings in the touched files; `framelog.rs` is rustfmt-clean (the tree as a whole is not).
 - Not verified: the lines in a game run (no game run by this workstream; the coordinator owns
   them). `ab_runs.py` was checked against lines printed by the unit test's own output.
+
+### WS4 results (foxhound base)
+
+Done 2026-11-27 on `memory-bridge-foxhound-ws4` (from 63edacb). No game run.
+
+**What changed.** A new module `crates/victory-bridge/src/intercept.rs` (one `pub mod` line in
+`lib.rs`) with the drop-ins S2 asked for beside WS0's `virtual_query`/`virtual_protect`, each with
+Windows' own arguments and results, each answering or refusing for a window and passing anything
+else to Wine unchanged: `virtual_alloc` (a commit, `MEM_RESET` or `MEM_RESET_UNDO` that meets a
+window: refused, `ERROR_INVALID_ADDRESS`, as a placeholder or a mapped view refuses a commit today;
+a reservation there Wine refuses itself), `virtual_free` (anything of a window: refused,
+`ERROR_INVALID_PARAMETER`, as Wine refuses a free of a mapped view; the window goes only by
+`window_remove`, then Wine's release), `nt_query_virtual_memory` (classes 0 basic; 6/7 region: one
+private reservation flagged *placeholder*, `CommitSize` = its views; 4 working set: Wine answers the
+entries, a window's are rewritten from the map), `query_working_set_ex` (the same for
+`K32QueryWorkingSetEx`), `get_write_watch` (never asked about a window: refused as Wine refuses
+memory that is not write-watched, `ERROR_INVALID_PARAMETER`; WS5 answers it with `watch_take`),
+`write_process_memory` (own process and meets a window: `NtWriteVirtualMemory`; else
+`WriteProcessMemory`), `meets(addr, len)` (any page in a window) and `title_import(name)`. Each
+has an `_on(Option<&Bridge>, ...)` form so the bridged branch is tested with a fake Unix half.
+`victory-gpu` now depends on `victory-bridge` (Cargo.toml and Cargo.lock, one line each).
+
+**Classification** (every non-test site in the workspace; the tests' own allocations, ~140 sites,
+are our own and not listed). *Title* = may meet a bridge window (xmem's pools); *own* = never does
+(our allocations, the image, code, IAT, stacks).
+
+| Site (after this change) | Call | Class | Now |
+|---|---|---|---|
+| `victory-gpu/src/watch.rs:287,302` (`sys`) | `VirtualProtect`, `VirtualQuery` | title | through `victory_bridge::virtual_protect`/`virtual_query`, still counted and timed for the frame log. Every non-test user in watch.rs goes through `sys`: `open_unlocked` (1215, 1220), `protect_alias` (2293, 2308), `protect_here` (2324, 2335), `unguard` (2462, 2467), `is_view` (2172), `uncommitted_end` (2398), `readable_view` (2819), `allocation_end` (2970), `writable` (3276) |
+| `watch.rs:335` `kernel_written` | `GetWriteWatch` | title | never asked when the range meets a window: `None` (the callers: not write-watched; views are then guarded through the routed protections). Marked "WS5: `watch_take` here" |
+| `watch.rs:1427` `placeholder` | `NtQueryVirtualMemory` (class 7) | title | through `intercept::nt_query_virtual_memory`: a window reads as a placeholder reservation (pages only by mapping), so its holes are "known holes" as xmem's placeholders are |
+| `watch.rs` `on_write` → `came_back` → `readable_view`/`writable` | `VirtualQuery` | title | routed (above): S2/M0's WS6 item for the handler is done here |
+| `victory-gpu/src/host.rs:8886` `read_sparse` | `VirtualQuery` | title | `victory_bridge::virtual_query` |
+| `host.rs:9030` `read_plain` (`VICTORY_SAFE_COPY=0`) | `ReadProcessMemory` | title | unchanged: works on bridge views (S2) |
+| `host.rs:9083` `write_mapped` (default) | `NtWriteVirtualMemory` | title | unchanged: works on bridge views (S2) |
+| `host.rs:9088` `write_mapped` (`VICTORY_DIRECT_WRITES=0`) | `WriteProcessMemory` | title | `intercept::write_process_memory`: `NtWriteVirtualMemory` when the range meets a window, `WriteProcessMemory` otherwise (identical off the bridge) |
+| `victory-gpu/src/inplace.rs:651` `private_whole`, `:1148` `kind_of` | `VirtualQuery` | title | `victory_bridge::virtual_query`: a bridged view reads `MEM_MAPPED`, so no `From::Part` heap is opened on it (WS7 changes this, S3) |
+| `inplace.rs:914-1073` (the in-place probe) | `VirtualAlloc(2)`, `VirtualFree`, `VirtualProtect`, `GetWriteWatch`, `ResetWriteWatch` | own | unchanged (its own reservations) |
+| `victory-gpu/src/texture.rs:2019` `readable` | `K32QueryWorkingSetEx` | title | `intercept::query_working_set_ex` (Wine says "not valid" for every window page; the fallback kernel read would still be right, one read per page) |
+| `texture.rs:2051` `committed_by_query`, `:2119` `mapped_bytes` | `VirtualQuery` | title | `victory_bridge::virtual_query` (`VICTORY_COMMITTED_QUERY=1`, and the walk of `mapped_bytes`) |
+| `victory-gpu/src/port.rs:236` `committed` | `VirtualQuery` | title | `victory_bridge::virtual_query` |
+| `victory-gpu/src/copystat.rs:543, 602, 1406` (diagnostics) | `K32QueryWorkingSetEx`, `VirtualQuery` | title (the address-space walk) | routed likewise |
+| `victory-gpu/src/safecopy.rs` | `rep movsb` + handler; `ReadProcessMemory` (`VICTORY_SAFE_COPY=0`) | title | unchanged (S2: both work on bridge views; its faults reach `on_write`, now answered right) |
+| `victory-gpu/src/upload.rs:77` | `VirtualAlloc2` | own | unchanged |
+| `victory-gpu/src/replay/hook.rs:68` (diagnostics) | `VirtualQuery` | own (module data) | unchanged |
+| `victory-gpu/src/timeline/hooks.rs:185-200` (diagnostics) | wrappers of the title's `GetWriteWatch`, `VirtualProtect`, `ReadProcessMemory`, `VirtualQuery`, `VirtualAlloc`, `VirtualFree` | title | unchanged; with the bridge on, the names `title_import` takes are bound to the drop-ins first and are no longer timed by the timeline |
+| `timeline/hooks.rs:312,314` | `VirtualProtect` | own (IAT slot) | unchanged |
+| `victory-gpu/src/titlewrite.rs` `import` | (the title's imports by name) | title | asks `intercept::title_import` first (below) |
+| `victory-hle/src/image_watch.rs:38` | `ReadProcessMemory` | own (the image) | unchanged |
+| `victory-hle/src/modules/xmem.rs:147` `XMemVirtualAlloc` | `VirtualAlloc2` (placeholders) | title | **WS3**: reserves the window (`MEM_RESERVE`, then `window_add`) instead |
+| `xmem.rs:248` `XMemVirtualQuery` | `VirtualQueryEx` | title | **WS3**: `victory_bridge::virtual_query` (own process) |
+| `xmem.rs:379` `XMemFreeDefault`, `:1509` `one_placeholder`, `:1990` `split` | `VirtualFree` (release, coalesce, split) | title | **WS3**: never on a window (`window_remove` first; no splits) |
+| `xmem.rs:2053` `commit` | `VirtualAlloc(MEM_COMMIT)` | title | **WS3**: a bridge `MAP`, never Wine's commit in a window |
+| `xmem.rs:2614` `one_placeholder_there` | `VirtualQuery` | title | **WS3**: `victory_bridge::query` |
+| `xmem.rs:2782, 2792, 2800` `title_virtual_free/query/protect` (the title's own, HLE exports) | `VirtualFree`, `VirtualQuery`, `VirtualProtect` | title | **WS3**: call `victory_bridge::intercept::virtual_free`, `victory_bridge::virtual_query`, `victory_bridge::virtual_protect` in place of windows-sys' (same arguments); tell `title_memory_freed` only of a free that was done |
+| `victory-loader/src/`: `windows.rs:289,299`; `tls.rs:55,66,132,158`; `thunks.rs:96,139`; `console_insn.rs:122,198,218,307,336,404,406`; `frame_rate.rs:207,211`; `write_sites.rs:269,274`; `crash.rs:743` | `VirtualProtect`, `VirtualAlloc`, `VirtualQuery` | own (image code and IAT, TLS, thunks, stubs; the crash report's faulting address) | unchanged. `crash.rs:743` may be asked about a window address in a crash report: it would say "reserved" (cosmetic; could use the drop-in later) |
+
+**The title's own imports.** `victory-loader` binds what `victory-hle`'s resolver gives: xmem's
+HLE exports first (`VirtualFree` always; `VirtualQuery`/`VirtualProtect` with soft views: WS3,
+above), then the host pass-through (`victory-hle/src/host.rs`), which already asks
+`victory_gpu::titlewrite::import(name, address)`. That function now returns
+`intercept::title_import(name)` first: with the bridge on (`available()`), `VirtualAlloc`,
+`VirtualFree`, `VirtualProtect`, `VirtualQuery`, `GetWriteWatch`, `WriteProcessMemory`,
+`NtQueryVirtualMemory`/`ZwQueryVirtualMemory` and `QueryWorkingSetEx`/`K32QueryWorkingSetEx` are
+bound to thin `extern "system"` wrappers (`intercept::title`) of the drop-ins; off, it is `None`
+and nothing changes (no wrapper is ever bound). No victory-loader file needed a change. Not wrapped
+(open): the `...Ex` variants taking a process, `VirtualAlloc2`/`MapViewOfFile3`,
+`NtAllocate/Free/ProtectVirtualMemory`, `ResetWriteWatch` (Wine fails it on a window without
+`MEM_WRITE_WATCH`, harmless), `IsBad*Ptr` (works, S2).
+
+**`VICTORY_BRIDGE=0` unchanged.** With no bridge every drop-in's first step is `bridge()` (a
+`OnceLock` read) giving `None`, then Wine's own call with the caller's arguments (the working-set
+drop-in calls `K32QueryWorkingSetEx`, the same export as before; `placeholder`'s
+`NtQueryVirtualMemory` is the same ntdll export); `meets` is false, so `kernel_written` and
+`write_mapped` do what they did; `title_import` is `None`, so every import is bound as before.
+`VICTORY_BRIDGE=1` without the DLL (all tests) takes the same path. Checked by the suites both ways
+(below) and by `outside_windows_the_drop_ins_are_the_systems_calls` (Wine's answers, with no bridge
+and with a bridge whose windows lie elsewhere).
+
+**Tests.** 7 new in `victory-bridge` (`intercept/tests.rs`): `meets` at the edges and without a
+bridge; the commit/free/watch verdicts in, across and outside a window and with no bridge; the
+region and working-set answers of a window; under Proton: outside windows every drop-in equals Wine
+(query, region size, write, the write watch finds the page, decommit, release, release of free
+memory refused by Wine); in a window (at addresses free to Wine) commit, decommit, release and
+write watch are refused with the errors above, basic, region and working-set questions are answered
+from the map (`STATUS_INFO_LENGTH_MISMATCH` for a short buffer; Wine's own entries kept beside the
+window's); another process's question is Wine's; `title_import` is `None` with the bridge off.
+`scripts/linux/test.sh` (`FORK_FEATURES=""`, Proton, `--lib`, one thread, the 4 process-killing
+GPU tests skipped as in WS8), the base 63edacb against this branch, `VICTORY_BRIDGE=0` and `=1`:
+
+| Crate | Base | `=0` | `=1` |
+|---|---|---|---|
+| `victory-bridge` | 20 passed | 27 passed | 27 passed |
+| `victory-loader` | 43 passed | 43 passed | 43 passed |
+| `victory-hle` | 169 passed, 2 failed | same | same |
+| `victory-gpu` | 414 passed, 7 failed | same | same |
+
+Pre-existing failures, the same in all three: `victory-hle`:
+`modules::net::tests::only_loopback_is_reachable`,
+`modules::xgamesave::tests::a_kept_blob_past_the_link_limit_is_copied`; `victory-gpu`:
+`watch::many_askers_tests::{bits_and_holes_with_faults_that_take_no_lock,
+holes_are_known_until_the_runtime_tells, no_mapping_is_lost_between_askers}`,
+`watch::tests::what_is_left_alone_is_no_known_hole`,
+`descriptor::host::tests::views_are_made_beside_the_heap_and_copied_in`,
+`indirect::tests::host_list_budget_starts_empty_at_each_submission`,
+`pipeline::library::tests::a_rejected_blob_gives_an_empty_library` (WS8's lists). `cargo xtask
+policy` passes; clippy (`victory-bridge`, and `victory-gpu` with `diagnostics`, all targets): no
+warning in the new module or the changed lines; the new files are rustfmt-clean (the touched old
+files are not as a whole and were not reformatted).
+
+**Why so many queries, and how many our books could answer** (§11: 11,143 `VirtualQuery` a usual
+frame, 28.6 ms over all threads, ~2.6 µs each through Wine's lock; on the frame's own threads
+8.0 ms a usual frame, 65 ms median in long frames). All of the counted ones are watch.rs's (only
+its `sys` is counted; texture.rs's and inplace's queries come on top, uncounted):
+- `guard` → `is_view(start, end)` for a range whose first block the guards do not know: with
+  `VICTORY_GUARD_HOLES` on (the default) it walks region by region through every hole of the
+  range, one query per region; then, per absent block of the range, `uncommitted_end` (one per
+  region of holes) and, for each block that came back, `is_view` again. A frame asks about
+  ~150,000 blocks (watch.rs's own comment), so a few percent of them in holey stretches is
+  thousands of queries.
+- `protect_here`: when protecting a run fails, block by block, `uncommitted_end` per failed region
+  and `placeholder` (an `NtQueryVirtualMemory`, not counted) per absent block.
+- `on_write`/`came_back`: `readable_view`/`writable` per fault (319 guard faults a usual frame: at
+  most ~600 queries); `allocation_end` per title free (rare); `look_at_holes` (1% of the held holes
+  a frame).
+
+Proposal, not implemented (none is trivially behaviour-preserving off the bridge):
+1. **Measure first**: tag `sys::VirtualQuery` with its caller (5 counters: `is_view`,
+   `uncommitted_end`, `readable_view`/`writable`, `allocation_end`, other) and print them in the
+   frame log's memory section; one coordinator run says which dominates.
+2. **On the bridge** (after WS3 puts the pools in windows): every one of these queries about title
+   view memory is answered by the bridge's map (this change routes them there), with no Wine lock.
+   **But see the first open issue: today that map's `query` is slower than Wine's on long runs.**
+   Once it is O(log n), ~10,000 queries at ~0.1 µs take ~1 ms a frame over all threads instead of
+   28.6, and on the frame's threads ~0.3 ms instead of 8 (usual frames) and a few ms instead of 65
+   (long frames), if the count stays the same.
+3. **Off the bridge, from our books**: `is_view` from `inplace::cover` (the views xmem tells with
+   `title_memory_view`: `Run`/`Scattered`/`Holes` mean a view; only `None` asks Wine: private heaps
+   and foreign memory); `uncommitted_end`/`placeholder` from xmem's page table (`Shown`: each
+   64 KiB page of its reservations is unmapped, a view or committed; needs a read-only hook from
+   xmem, WS3, like `SoftViews::runs`); `readable_view`/`writable` for blocks in `g.protected`
+   (read-only by our hand: a view, `PAGE_READONLY`) without asking. Wine stays the answer for
+   anything the books do not cover (the title's own `VirtualProtect`, through xmem's
+   `title_virtual_protect`, would then have to tell the watch). Expected: most of the count, if (1)
+   confirms that `is_view` and `uncommitted_end` dominate.
+
+**Open issues.**
+- **Blocker for the gain on the bridge (WS0/coordinator, `map.rs`): the map never coalesces
+  segments, and `Map::query` walks forward through every following segment of the same run** to
+  find its length. Measured natively (release build, this PC): one window of 60,000 views of
+  64 KiB of consecutive pool bytes, mapped one by one: **132 µs per `query`** at the run's start
+  (50x Wine's ~2.6 µs); after unmapping them one by one, 122 µs for the unmapped run; `window()`
+  7 ns. Fix: merge a segment with its neighbours in `Map::set` when `continued_by` holds (a run is
+  then one segment and `query` O(log n)), or bound the walk. `intercept::committed_in` (the region
+  classes) walks the window by `query`, so it is quadratic until then (a rare call).
+- WS3: the xmem sites above (its title exports must use the drop-ins; `title_memory_freed` only
+  after a free that was done).
+- WS5: `kernel_written` returns `None` for windows (guards then); `watch_take` goes there.
+  `inplace.rs`'s probe and the title's `ResetWriteWatch` are untouched.
+- WS6: the handler's queries are routed; `safecopy` and the `ReadProcessMemory` /
+  `NtWriteVirtualMemory` paths are unchanged per S2.
+- WS7: `private_whole`/`kind_of` see bridged views as `MEM_MAPPED` (no in-place heap there yet).
+- The drop-ins' bridged answers still count as "region queries" / "protection changes" in the frame
+  log (cheap, but counted): after WS3 the count stays and the time falls.
+- Not verified: anything in a game run (none by this workstream), and the bridged branch against a
+  real Unix half (tested against a fake only; WS1/WS2 are not merged here).

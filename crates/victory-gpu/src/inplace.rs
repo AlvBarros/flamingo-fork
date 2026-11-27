@@ -646,7 +646,9 @@ pub(crate) fn private_whole(at: usize, len: usize) -> bool {
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    // (The memory bridge answers for its windows: views there are mapped,
+    // never private, so no heap of this kind is opened on them; WS7.)
+    let n = unsafe { victory_bridge::virtual_query(at as *const c_void, &mut info, size_of_val(&info)) };
     n != 0
         && info.State == mem::MEM_COMMIT
         && info.Type == mem::MEM_PRIVATE
@@ -1143,7 +1145,7 @@ fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
     // SAFETY: plain data filled in by the query.
     let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { mem::VirtualQuery(at as *const c_void, &mut info, size_of_val(&info)) };
+    let n = unsafe { victory_bridge::virtual_query(at as *const c_void, &mut info, size_of_val(&info)) };
     if n == 0 {
         return 5;
     }

@@ -535,7 +535,7 @@ fn memory_map() -> bool {
 /// Asks which of the pages in `asked` (address, answer) are in physical
 /// memory and adds the bytes each stands for (kind, bytes) to its kind.
 fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, present: &mut [u64; 10]) {
-    use windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx;
+    use victory_bridge::intercept::query_working_set_ex as K32QueryWorkingSetEx;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     // SAFETY: our own process; `asked` holds that many entries of two
     // words each, as the call fills them in.
@@ -571,8 +571,9 @@ fn in_memory(asked: &mut Vec<[usize; 2]>, stands: &mut Vec<(usize, u64)>, presen
 fn log_memory_map() {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_WRITECOMBINE,
-        VirtualQuery,
     };
+    // (The memory bridge answers for its windows: views, not one reservation.)
+    use victory_bridge::virtual_query as VirtualQuery;
     const KINDS: [&str; 10] = [
         "the title's heaps (private, console addresses)",
         "views of the title's pages (mapped, console addresses)",
@@ -1397,7 +1398,8 @@ pub(crate) fn log(frames: f64) {
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
     for ((src, len), (n, bytes, us, _)) in ranges.into_iter().take(10) {
-        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        use victory_bridge::virtual_query as VirtualQuery;
+        use windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION;
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.

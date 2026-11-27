@@ -40,6 +40,7 @@
 //! The ABI is in [`abi`] (mirrored in `bridge/unix/abi.h`).
 
 pub mod abi;
+pub mod intercept;
 pub mod map;
 
 use std::sync::atomic::{AtomicBool, Ordering};

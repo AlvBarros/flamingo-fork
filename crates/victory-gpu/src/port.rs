@@ -232,7 +232,8 @@ fn committed(at: usize, len: usize) -> bool {
         // SAFETY: plain data filled in by the query.
         let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        if unsafe { mem::VirtualQuery(here as *const _, &mut info, size_of_val(&info)) } == 0 || info.State != mem::MEM_COMMIT {
+        // (Title memory: the memory bridge answers for its windows.)
+        if unsafe { victory_bridge::virtual_query(here as *const _, &mut info, size_of_val(&info)) } == 0 || info.State != mem::MEM_COMMIT {
             return false;
         }
         here = (info.BaseAddress as usize).saturating_add(info.RegionSize);

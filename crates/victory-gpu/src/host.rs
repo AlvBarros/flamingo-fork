@@ -8856,8 +8856,10 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 /// After a failed bulk read into host memory, skip contiguous holes. Never
 /// cache the query across copies: the title may remap the same address.
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
+    // (Title memory: the memory bridge answers for its windows.)
+    use victory_bridge::virtual_query as VirtualQuery;
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS,
     };
     let mut offset = 0;
     while offset < len {
@@ -9056,7 +9058,11 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
+    // `WriteProcessMemory` always fails in a memory bridge window (it asks
+    // `VirtualQuery` first, which says reserved there: spike S2); the
+    // drop-in writes there with `NtWriteVirtualMemory`, and is
+    // `WriteProcessMemory` anywhere else.
+    use victory_bridge::intercept::write_process_memory as WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     crate::watch::materialize(dst as usize, len);
     let direct = direct_writes();

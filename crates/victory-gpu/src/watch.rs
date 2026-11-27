@@ -261,6 +261,11 @@ impl Drop for Asking {
 /// timed into the frame log's totals (`crate::framelog`, lines with
 /// `VICTORY_FRAME_LOG=1`); the functions below import these in place of
 /// windows-sys' own. Under Wine each is a call into the address-space lock.
+/// Both go through the memory bridge's drop-ins (`victory_bridge`): for an
+/// address in one of its windows the bridge answers from its own map and
+/// protects through its Unix half (Wine would say "reserved" there and
+/// refuse); anything else, and everything with the bridge off, is Wine's
+/// call as before.
 #[allow(non_snake_case)]
 mod sys {
     use crate::framelog::{T, timed};
@@ -279,7 +284,7 @@ mod sys {
     ) -> BOOL {
         // SAFETY: the caller's.
         timed(T::ProtectCalls, T::ProtectNs, || unsafe {
-            windows_sys::Win32::System::Memory::VirtualProtect(at, len, new, old)
+            victory_bridge::virtual_protect(at, len, new, old)
         })
     }
 
@@ -294,7 +299,7 @@ mod sys {
     ) -> usize {
         // SAFETY: the caller's.
         timed(T::QueryCalls, T::QueryNs, || unsafe {
-            windows_sys::Win32::System::Memory::VirtualQuery(at, info, len)
+            victory_bridge::virtual_query(at, info, len)
         })
     }
 }
@@ -310,6 +315,13 @@ thread_local! {
 fn kernel_written(first: usize, last: usize) -> Option<Vec<(usize, u16)>> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    // A memory bridge window: Wine's write watch sees nothing written there
+    // (spike S2) and is never asked; the callers take it as memory that is
+    // not write-watched (views: guarded). WS5: `victory_bridge::watch_take`
+    // here.
+    if victory_bridge::intercept::meets(first * PAGE, (last - first) * PAGE) {
+        return None;
+    }
     FOUND.with(|found| {
         let mut found = found.borrow_mut();
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -1403,17 +1415,9 @@ fn placeholder(block: usize) -> bool {
         partition_id: usize,
         node_preference: usize,
     }
-    #[link(name = "ntdll", kind = "raw-dylib")]
-    unsafe extern "system" {
-        fn NtQueryVirtualMemory(
-            process: *mut std::ffi::c_void,
-            at: *const std::ffi::c_void,
-            class: u32,
-            out: *mut std::ffi::c_void,
-            len: usize,
-            returned: *mut usize,
-        ) -> i32;
-    }
+    // (Through the memory bridge's drop-in: a window of the bridge's is one
+    // reservation in which pages come only by mapping, and says so.)
+    use victory_bridge::intercept::nt_query_virtual_memory as NtQueryVirtualMemory;
     // (Class 3 answers with the kind of memory in that word, not the flags.)
     const MEMORY_REGION_INFORMATION_EX: u32 = 7;
     const PLACEHOLDER_RESERVATION: u32 = 1 << 8;

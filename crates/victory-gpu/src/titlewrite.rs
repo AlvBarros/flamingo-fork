@@ -70,7 +70,19 @@ type Set = unsafe extern "system-unwind" fn(*mut u8, i32, usize) -> *mut u8;
 
 /// What the title's import of `name`, which the host has at `address`, is
 /// bound to.
+///
+/// With the memory bridge on (`VICTORY_BRIDGE`), the title's own memory
+/// calls that must not reach Wine in a bridge window (`VirtualAlloc`,
+/// `VirtualFree`, `VirtualProtect`, `VirtualQuery`, `GetWriteWatch`,
+/// `WriteProcessMemory`, `NtQueryVirtualMemory`, `QueryWorkingSetEx`) are
+/// bound to the bridge's drop-ins, which are the host's own call outside
+/// windows (`victory_bridge::intercept::title_import`). Off, nothing
+/// changes. (Those xmem overrides itself, the runtime's `VirtualFree` and,
+/// with soft views, `VirtualQuery`/`VirtualProtect`, never come here.)
 pub fn import(name: &str, address: usize) -> usize {
+    if let Some(ours) = victory_bridge::intercept::title_import(name) {
+        return ours;
+    }
     let (which, ours) = match name {
         "memcpy" => (0, copy as *const () as usize),
         "memmove" => (1, shift as *const () as usize),
