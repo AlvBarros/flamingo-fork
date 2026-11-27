@@ -574,3 +574,32 @@ applies to the parent spike's `load.exe`.
 - *Per-op result reporting:* it costs nothing measurable, so keep it in the ABI. xmem's `change`
   passes `results`, which keeps the per-op `done` it uses today to decide what to note. Other
   callers pass 0 and read `done`/`error`.
+
+## 11. Progress on the foxhound base
+
+Branch `memory-bridge-foxhound` (from `linux-foxhound-base`, b3fc71c), started 2026-11-27. Same
+rules as §10: `VICTORY_BRIDGE` off by default and `=0` unchanged; tests both ways; `cargo xtask
+policy` before every push; game runs announced here and never overlapping another session's.
+Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subsection at the end.
+
+### Status
+
+| Item | Owner | Branch | State |
+|---|---|---|---|
+| Re-scope: where do this base's slow frames go | coordinator | `memory-bridge-foxhound` | in progress |
+| WS8 frame log ported to this base | agent | `memory-bridge-foxhound-ws8` | in progress |
+| WS1-WS7, WS9 | — | — | waiting for the re-scope |
+
+### Runs
+
+- 2026-11-27 ~12:10: another session is running `flamingo-main` (prebuild, then a 10-minute play
+  run, prefix `flamingo-fork-foxhound`). No run of ours meanwhile; its log, with this base's
+  current settings, is the re-scope's first data.
+
+### Re-scope
+
+- The last two logs that ran this base (`b190242`, 2026-11-27 09:20 and 09:30) ran **without**
+  `VICTORY_SOFT_VIEWS` and at 720p, so they do not represent the tuned base. For the record, in
+  them write tracking was still large: per frame, all threads, median / p90: kernel askings
+  6-9 / 80-160 ms, waits for the guards 11-12 / 56-90 ms, protection changes 7-9 / 43-45 ms; on
+  the submitting thread 4-5 / 36-46 ms asking the write watch; copies 22-25 / 250-885 ms.
