@@ -16,6 +16,8 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh", "py",
+    // Linux fork: the run settings (scripts/linux/play.env); the memory bridge's C halves.
+    "env", "c", "h",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",

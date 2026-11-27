@@ -647,6 +647,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-bridge"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "windows-sys",
+]
+
+[[package]]
 name = "victory-core"
 version = "0.1.0"
 dependencies = [
