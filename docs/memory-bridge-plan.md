@@ -683,6 +683,17 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
   cafeteria and prison and other NPCs". Next: the user's 15-minute hand-played session
   (`scripts/linux/play-session.sh 15`, `VICTORY_BRIDGE=1`), then WS5.
 
+- **The user's 15-minute hand-played session on the bridge** (`logs/session-20261127-142939/`,
+  report there): bridge on, no crash. Prison and cafeteria loading smooth (median 56-76 ms, worst
+  586 ms after start). The laggy bank and police minutes (14:35-14:39, median 80-110 ms) coincide
+  with the machine out of RAM (free ~0.3 GB, swap-out up to 240 MB/s, 10.8 GB of swap used) and
+  VRAM full (11.9 of 12 GB); their long frames are DirectStorage disk work, guard waits and the
+  card idle. Open: the frame log's free memory read ~3.5 GB lower on the bridge than without it
+  at the same point, uncontrolled (other programs); not found by reading the code (Wine's
+  sections are tmpfs here too, pool teardown looks right). The user accepts more RAM for now;
+  measure later with the game process's own RssShmem/RssAnon, bridge off vs on, 4 min each.
+  Next after that: WS5 (guards).
+
 ### WS8 results (foxhound base)
 
 Done 2026-11-27 on `memory-bridge-foxhound-ws8`. The per-frame log of the Flamingo-based branch
