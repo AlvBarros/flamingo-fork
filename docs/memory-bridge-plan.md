@@ -586,9 +586,14 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
 
 | Item | Owner | Branch | State |
 |---|---|---|---|
-| Re-scope: where do this base's slow frames go | coordinator | `memory-bridge-foxhound` | measured (frame log run 13:24); decision pending |
+| Re-scope: where do this base's slow frames go | coordinator | `memory-bridge-foxhound` | done: go (17 ms a usual frame, ~119 of a long frame's 145 on the critical path) |
 | WS8 frame log ported to this base | agent | `memory-bridge-foxhound-ws8` | done, merged (76498ca) |
-| WS1-WS7, WS9 | — | — | waiting for the re-scope |
+| WS1 Unix half | agent | `memory-bridge-foxhound-ws1` | in progress |
+| WS2+WS9 PE half, loading, build and packaging | agent | `memory-bridge-foxhound-ws2` | in progress |
+| WS3 xmem on the bridge | agent | `memory-bridge-foxhound-ws3` | in progress |
+| WS4 queries and protections | agent | `memory-bridge-foxhound-ws4` | in progress |
+| WS5, WS6 | — | — | after WS3 |
+| WS7 | — | — | later (S3: `OpenExistingHeapFromAddress1` only) |
 
 ### Runs
 
@@ -601,7 +606,7 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
   Done 13:24-13:35, no crash (`logs/20261127-132421-play.log`).
 - 2026-11-27 (this session): **run announced** — the same, plus the frame log's split of the
   memory watch's costs on the frame's own threads (preparing, presenting, submitting), to measure
-  what the bridge could take off the frame's critical path.
+  what the bridge could take off the frame's critical path. Done 13:39-13:50, no crash.
 
 ### Re-scope
 
@@ -637,6 +642,22 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
     frames' remapping bursts (1% of the time). Not yet known: how much of the summed waits lies
     on the submitting/render thread's critical path (the log sums threads; the frame is bound by
     preparing 34 ms + present 18.5 ms). No switch turns the guards off for a cheap upper bound.
+
+- **On the frame's critical path** (`logs/20261127-133935-play.log`, c463e1a: the frame log's
+  split of the memory watch's costs on the threads that prepare, present or submit; same settings;
+  no crash). This run was rougher than the 13:24 one (p99 194 ms against 81, max 1.06 s, 64 long
+  frames, 4.5% of the time; run-to-run variance, more remapping: 3.1 ms a usual frame, 101 ms
+  median in long frames), the usual frame alike (58 against 56 ms).
+  - Usual frame (58.3 ms), on the frame's threads: region queries 8.0 ms, guard waits 5.0,
+    write-watch askings 2.6, protections 0.7, other watch locks 0.9: **17.2 ms, ~30% of the
+    frame**. Guard faults: none there (the title's threads take them).
+  - Long frames (median 145.5 ms), on the frame's threads: region queries 65.0 ms, guard waits
+    34.7, askings 16.1, protections 3.5: **~119 ms of the 145**; plus remapping (101 ms median,
+    all threads: soft views made real).
+  - **Decision: go** (the bar set before measuring was 10 ms a usual frame). Region queries come
+    first (WS4, answered from the bridge's map once title memory is in bridge windows: WS3), then
+    the guards and askings (WS5), and the long frames' remapping (WS3). Order: WS1, WS2+WS9, WS3,
+    WS4 in parallel now; WS5, WS6 after WS3.
 
 ### WS8 results (foxhound base)
 
