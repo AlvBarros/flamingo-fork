@@ -86,3 +86,6 @@ Thumbs.db
 # Linux fork: run logs and local settings
 /logs/
 /scripts/linux/play.local.env
+# Linux fork: the memory bridge's build outputs (bridge/pe/build.sh writes them under target/)
+*.so
+*.o

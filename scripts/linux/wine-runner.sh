@@ -11,4 +11,18 @@
 fork_compiler
 fork_vkd3d
 fork_overrides
+# VICTORY_BRIDGE set and not 0: the bridge from FORK_BRIDGE_DIR (test.sh: the
+# one build.sh put beside victory.exe) is copied beside the program, where
+# victory-bridge's loader looks (Wine does not search WINEDLLPATH for a DLL
+# loaded by name), and WINEDLLPATH names that directory. Unset or 0: nothing.
+here=$(dirname "$1")
+case "${VICTORY_BRIDGE:-0}" in
+    0) ;;
+    *) [ -n "$FORK_BRIDGE_DIR" ] && for f in victorybridge.dll victorybridge.so; do
+           [ -f "$FORK_BRIDGE_DIR/$f" ] && ! cmp -s "$FORK_BRIDGE_DIR/$f" "$here/$f" &&
+               cp -f "$FORK_BRIDGE_DIR/$f" "$here/$f"
+       done ;;
+esac
+fork_bridge "$here"
+case "$FORK_BRIDGE_STATE" in *missing*) echo "wine-runner: $FORK_BRIDGE_STATE" >&2 ;; esac
 exec "$WINE" "$@"

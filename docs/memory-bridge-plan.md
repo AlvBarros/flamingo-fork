@@ -762,3 +762,86 @@ one thread, against the base b3fc71c built the same way:
   clippy warnings in the touched files; `framelog.rs` is rustfmt-clean (the tree as a whole is not).
 - Not verified: the lines in a game run (no game run by this workstream; the coordinator owns
   them). `ab_runs.py` was checked against lines printed by the unit test's own output.
+
+### WS2+WS9 results (foxhound base)
+
+Done 2026-11-27 on `memory-bridge-foxhound-ws2`. Proton Experimental (wine-11.0,
+experimental-11.0-20261123b), MinGW-w64 gcc, system `winebuild` 11.22; no game run.
+
+**Built.**
+- `bridge/pe/victorybridge_pe.c`: `DllMain` takes the unix handle
+  (`NtQueryVirtualMemory(..., MemoryWineUnixFuncs = 1000, ...)`) and `__wine_unix_call_dispatcher`
+  as the spikes did; one export, `LONG WINAPI victorybridge_call(UINT32 code, void *args)`
+  (undecorated name, checked with `objdump -p`; on x86_64 `WINAPI` is the one Windows x64
+  convention, so it matches `lib.rs`'s `unsafe extern "system" fn(u32, *mut c_void) -> i32`).
+  Without a Unix half it returns `STATUS_NOT_SUPPORTED` (0xC00000BB) for every call; call numbers
+  `>= VB_CALLS` are refused with `STATUS_INVALID_PARAMETER` (Wine's dispatcher indexes the Unix
+  half's table unchecked). The DLL always loads; the Rust side's VERSION call decides.
+- `bridge/pe/build.sh OUTDIR [unix sources]`: MinGW `-shared` + `winebuild --builtin` for the
+  `.dll`, gcc `-shared -fPIC -I bridge/unix` over `bridge/unix/*.c` (files with "test" in the
+  name left out) for the `.so`; both made in a scratch directory inside OUTDIR and moved in only
+  when both built. No Unix half in `bridge/unix/`: nothing built, a note (exit 0).
+- `scripts/linux/build.sh` runs it after the game, into `target/x86_64-pc-windows-msvc/release/`
+  beside `victory.exe`; a failure warns and the build still succeeds (`FORK_BRIDGE=0` skips it).
+- `scripts/linux/env.sh` `fork_bridge DIR`: only when `VICTORY_BRIDGE` is set and not `0` (the
+  crate's rule), and both files are in DIR, `WINEDLLPATH=DIR[:previous]`; sets the header line.
+  `run.sh` calls it with `victory.exe`'s directory; `wine-runner.sh` copies the bridge from
+  `FORK_BRIDGE_DIR` (test.sh sets it to build.sh's output when asked; may be preset) beside each
+  test program and calls it with that directory.
+- `.gitignore`: `*.so`, `*.o` (all outputs are under `target/` anyway).
+- `crates/victory-bridge/examples/bridge_probe.rs`: prints `asked()` and `available()`; exit 0
+  when available (or, with the argument `off`, when not). `lib.rs` unchanged.
+
+**How.** `scripts/linux/build.sh` (as before); `VICTORY_BRIDGE=1 scripts/linux/run.sh ...`;
+`VICTORY_BRIDGE=1 scripts/linux/test.sh [-p crate]`; the loading test:
+`bridge/pe/test/run.sh [outdir]` (default `target/bridge-pe-test`, own prefix `pfx` there, stops
+only its own wineserver; `BRIDGE_PROBE=0` skips the Rust part).
+
+**Header line** (after `fork_home`), only with `VICTORY_BRIDGE` set and not `0`:
+
+    bridge     asked (VICTORY_BRIDGE=1): victorybridge.dll + .so present in <dir> (built <date>), WINEDLLPATH=<dir>; whether it loaded: 'memory bridge on' or a warning in the log
+    bridge     asked (VICTORY_BRIDGE=1) but victorybridge.dll/.so missing in <dir> (scripts/linux/build.sh builds them once bridge/unix/ has its Unix half): the present path stays
+
+Whether it actually loaded is known only inside the process: the crate logs `memory bridge on
+(VICTORY_BRIDGE)` or its warning.
+
+**Unchanged when off, checked.** `run.sh check` of the committed scripts against the new ones,
+with a stand-in `wine` that dumps its environment (`FORK_WINE`, a scratch `FORK_HOME`, so no game
+and no real prefix): with `VICTORY_BRIDGE` unset and `=0` the headers are identical and the
+environments handed to Wine identical; `=` (empty) adds only the caller's own variable. With
+`=1` the header gains the one line and the environment exactly `WINEDLLPATH` (prepended to a
+preset one).
+
+**Verified under Proton** (`bridge/pe/test/run.sh`, all pass, stub Unix half
+`bridge/pe/test/stub_unix.c`: VERSION answers `VB_VERSION`, the rest refuse):
+- C loader (`load.c`, what `victory_bridge::loader::entry()` does): DLL beside the program,
+  `WINEDLLPATH` set: loads as builtin, VERSION status 0, version 1, the Unix half's pid differs
+  from the Windows one (it ran on the Linux side); call 11 refused 0xC000000D; POOL_CREATE gets
+  the stub's 0xC0000002.
+- Same without `WINEDLLPATH`: the DLL loads, every call returns 0xC00000BB (no Unix half found),
+  so the crate reports the bridge off.
+- **New finding:** `LoadLibraryW(L"victorybridge.dll")` (the loader's fallback by bare name) from
+  a program elsewhere, run from elsewhere, does **not** find the DLL on `WINEDLLPATH` (error 126;
+  also not with an `x86_64-windows/` subdirectory). It is found by name only on the ordinary search
+  path (the program's directory, the current directory). So the files must be beside the program:
+  build.sh puts them beside `victory.exe`, wine-runner.sh beside each test program.
+- Rust side end to end (`bridge_probe.exe`, cargo-xwin, beside the DLL): `VICTORY_BRIDGE=1` +
+  `WINEDLLPATH`: `available()` true; unset, `0`, no `WINEDLLPATH`, or the program elsewhere: false.
+- `VICTORY_BRIDGE=1 FORK_BRIDGE_DIR=target/bridge-pe-test scripts/linux/test.sh -p victory-bridge`
+  (own scratch prefix): the bridge loads in the test process (19 passed), and so
+  `tests::without_the_dll_nothing_is_bridged` fails (`!available()`): it assumes tests never have
+  the DLL beside them. Without `VICTORY_BRIDGE`: 20 passed, the files still beside the test.
+- `FORK_FEATURES=diagnostics scripts/linux/build.sh` builds `victory.exe` (bridge: the note, no
+  Unix half yet); with a stand-in Unix half in `bridge/unix/` both files land beside
+  `victory.exe`; with a broken one: a warning, exit 0, the earlier files left as they were.
+  `cargo xtask policy` passes.
+
+**Open.**
+- `without_the_dll_nothing_is_bridged` (WS0's test) should skip itself when `available()` is
+  true, or the suite with `VICTORY_BRIDGE=1` always has one failure.
+- The loader's bare-name fallback in `lib.rs` never finds the bridge on `WINEDLLPATH`; harmless
+  (the beside path is what is used) but its comment "(then on the DLL search path)" is all it
+  does.
+- `WINEDLLPATH` names `victory.exe`'s directory (`target/.../release`), so Wine would also take
+  any other builtin-marked DLL placed there as builtin; nothing else there is one today.
+- Not tried with the real Unix half (WS1) or in a game run.

@@ -1,7 +1,8 @@
 # Shared Wine/Proton set-up for run.sh and wine-runner.sh (sourced, not run).
 #
 # Sets FORK_HOME, PROTON_DIR, WINEPREFIX, WINEDEBUG, WINEDLLOVERRIDES and WINE,
-# and makes sure the prefix uses Microsoft's d3dcompiler_47.dll.
+# and makes sure the prefix uses Microsoft's d3dcompiler_47.dll; fork_bridge
+# sets WINEDLLPATH for the memory bridge when VICTORY_BRIDGE asks for it.
 #
 # Why d3dcompiler_47: the layer compiles a few compute shaders at run time
 # with D3DCompile (the indirect-argument clamp, its worker, the card compare,
@@ -94,4 +95,22 @@ fork_overrides() {
     o="d3d12,d3d12core,dxgi,d3d11=n,b"
     [ -n "$FORK_EXTRA_OVERRIDES" ] && o="$o;$FORK_EXTRA_OVERRIDES"
     export WINEDLLOVERRIDES="$o${WINEDLLOVERRIDES:+;$WINEDLLOVERRIDES}"
+}
+
+# The memory bridge (docs/memory-bridge-plan.md, bridge/README.md): only when
+# VICTORY_BRIDGE is set and not 0 (as victory-bridge reads it), and then only
+# when victorybridge.dll and victorybridge.so are both in $1 (build.sh puts
+# them beside victory.exe): WINEDLLPATH gets $1 in front, because Wine finds a
+# builtin DLL's Unix half only on WINEDLLPATH (beside the .dll is not enough;
+# spikes S1, S2, S4). Sets FORK_BRIDGE_STATE to one line saying so. With
+# VICTORY_BRIDGE unset, empty or 0 it changes nothing and says nothing.
+fork_bridge() {
+    FORK_BRIDGE_STATE=""
+    case "${VICTORY_BRIDGE:-0}" in 0) return 0 ;; esac
+    if [ -f "$1/victorybridge.dll" ] && [ -f "$1/victorybridge.so" ]; then
+        export WINEDLLPATH="$1${WINEDLLPATH:+:$WINEDLLPATH}"
+        FORK_BRIDGE_STATE="bridge     asked (VICTORY_BRIDGE=$VICTORY_BRIDGE): victorybridge.dll + .so present in $1 (built $(date -r "$1/victorybridge.so" '+%Y-%m-%d %H:%M')), WINEDLLPATH=$WINEDLLPATH; whether it loaded: 'memory bridge on' or a warning in the log"
+    else
+        FORK_BRIDGE_STATE="bridge     asked (VICTORY_BRIDGE=$VICTORY_BRIDGE) but victorybridge.dll/.so missing in $1 (scripts/linux/build.sh builds them once bridge/unix/ has its Unix half): the present path stays"
+    fi
 }

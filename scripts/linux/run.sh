@@ -15,6 +15,8 @@
 #   FORK_GAME    the title's exe, for `play` with no path
 #   FORK_PLAY_ARGS  victory run options when `play` is given none
 #   VICTORY_*    passed through to victory.exe (see README.md)
+#   VICTORY_BRIDGE  set and not 0: the memory bridge (WINEDLLPATH set; the
+#                header says whether its files are beside victory.exe)
 #   FORK_D3DCOMPILER  Microsoft's d3dcompiler_47.dll, if not found (see env.sh)
 set -e
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -87,6 +89,9 @@ fi
 fork_compiler
 fork_vkd3d
 fork_overrides
+# VICTORY_BRIDGE set and not 0: WINEDLLPATH names victory.exe's directory,
+# where build.sh puts the bridge (env.sh); unset or 0: nothing changes.
+fork_bridge "$(dirname "$EXE")"
 export VICTORY_CACHE_DIR="$(winpath "$FORK_HOME/cache")"
 export VICTORY_DATA_DIR="$(winpath "$FORK_HOME/data")"
 # VICTORY_SKIP_PIPELINES=<hash>,...: pipelines with these shaders are never
@@ -104,6 +109,7 @@ fork_header() {
         echo "vkd3d      $(cut -d' ' -f2- "$PROTON_DIR/files/lib/wine/vkd3d-proton/version" 2>/dev/null || echo '?')"
         echo "driver     NVIDIA $(grep -o '[0-9]\{3\}\.[0-9]*\.[0-9]*' /proc/driver/nvidia/version 2>/dev/null | head -1)"
         echo "fork_home  $FORK_HOME"
+        [ -n "$FORK_BRIDGE_STATE" ] && echo "$FORK_BRIDGE_STATE"
         [ -n "$FORK_RUN_WHAT" ] && echo "$FORK_RUN_WHAT"
         echo "settings   (source in brackets; the environment wins over play.local.env over play.env)"
         printf '%s\n' "$FORK_SETTINGS" | sed '/^$/d; s/^/  /'

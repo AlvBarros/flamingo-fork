@@ -7,6 +7,12 @@
 #   scripts/linux/build.sh            # release build
 #   scripts/linux/build.sh --features diagnostics
 #
+# Also builds the memory bridge's DLL (victorybridge.dll + victorybridge.so,
+# bridge/pe/build.sh: MinGW, winebuild, gcc) beside victory.exe when its Unix
+# half is in bridge/unix/; a bridge that does not build only warns (the game
+# runs without it: it is used only with VICTORY_BRIDGE set and not 0).
+# FORK_BRIDGE=0 skips it.
+#
 # Needs: rustup, and `cargo install --locked cargo-xwin` (it downloads the
 # Microsoft CRT and Windows SDK headers/libraries on first use, under
 # Microsoft's license).
@@ -37,3 +43,7 @@ ln -sf "$TOOLS/rust-lld" "$FORK_HOME/bin/lld-link"
 FEATURES="${FORK_FEATURES-diagnostics}"
 PATH="$FORK_HOME/bin:$PATH" cargo xwin build --release --locked -p victory --target "$TARGET" ${FEATURES:+--features "$FEATURES"} "$@"
 echo "built: $ROOT/target/$TARGET/release/victory.exe"
+if [ "${FORK_BRIDGE:-1}" != 0 ]; then
+    sh "$ROOT/bridge/pe/build.sh" "$ROOT/target/$TARGET/release" ||
+        echo "build.sh: WARNING: the memory bridge did not build (victorybridge.dll/.so there, if any, are an earlier build); victory.exe is built" >&2
+fi
