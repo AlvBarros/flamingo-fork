@@ -608,6 +608,7 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
   memory watch's costs on the frame's own threads (preparing, presenting, submitting), to measure
   what the bridge could take off the frame's critical path. Done 13:39-13:50, no crash.
 - 2026-11-27 (this session): **run announced** — e8f663f, **`VICTORY_BRIDGE=1`** (first game run on the bridge), otherwise as the 13:39 run; 5 min unattended (short runs from now on).
+  Done 14:18-14:24: `memory bridge on (VICTORY_BRIDGE) features=3`, no crash.
 
 ### Re-scope
 
@@ -668,6 +669,19 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
   30/30 and `victory-hle` 188 passed + the base's 2 failures, the same as `=0`. Open: one full
   `victory-bridge` run in about seven died with the real DLL and the emulator in one process
   (WS3's note: the emulator re-reserves a window as a placeholder, racy; tests only).
+
+- **First game run on the bridge (M1)** (`logs/20261127-141835-play.log`, e8f663f, `VICTORY_BRIDGE=1`,
+  5 min; against the 13:39 run without it, same settings, both under Proton; `ab_runs.py ... 0 300`,
+  the first 300 s after drawing starts, i.e. the cutscene's loading of the cafeteria and prison):
+  frames over 250 ms 3.3% -> **0.4%**, p99 491 -> **186 ms**, time in long frames 17.3% -> 7.3%,
+  the worst minute's median 230 -> 67 ms; the usual frame unchanged (56 -> 59 ms). Per frame: region
+  queries 48.6 ms (all threads; 9.3 on the frame's threads) -> **0.1** (0.0); Windows mapping calls
+  gone; remapping in long frames 406 -> 13 ms median; copies 32 -> 18 ms usual, long -83%; write
+  watch -60%. Unchanged: **guards** (waits 81 -> 114 ms all threads, ~5 ms on the frame's threads)
+  and protection changes: WS5 next. Disk workers busier (13 -> 30 ms; streaming faster, to see).
+  The user, watching: "the best the cutscene has been by far ... ~15 fps all the way, loading the
+  cafeteria and prison and other NPCs". Next: the user's 15-minute hand-played session
+  (`scripts/linux/play-session.sh 15`, `VICTORY_BRIDGE=1`), then WS5.
 
 ### WS8 results (foxhound base)
 
