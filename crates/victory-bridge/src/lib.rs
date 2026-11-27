@@ -17,9 +17,16 @@
 //!   through Wine (`VirtualAlloc(MEM_RESERVE)`, one per title pool range,
 //!   made by xmem) and then handed over with [`window_add`]. Wine keeps
 //!   believing they are reserved and never places anything there.
-//! - **Only the bridge changes pages inside a window.** No `VirtualProtect`,
-//!   `VirtualFree`, `MapViewOfFile*` or `VirtualAlloc(MEM_COMMIT)` there:
-//!   Wine would act on its own idea of the range and break ours. Code that
+//! - **Only the bridge changes pages inside a window.** Measured under Proton
+//!   (spike S2), these must never reach Wine there: `VirtualAlloc(MEM_COMMIT)`
+//!   (succeeds, `mprotect`s our view, and Wine then believes the pages are
+//!   its own), `VirtualFree(MEM_DECOMMIT)` (replaces our view),
+//!   `VirtualFree(MEM_RELEASE)` (unmaps every view: [`window_remove`] first),
+//!   `VirtualProtect`/`NtProtectVirtualMemory`, `MapViewOfFile*`; nor these,
+//!   whose answers are wrong there: `VirtualQuery`/`NtQueryVirtualMemory`
+//!   ("reserved"), `GetWriteWatch` (sees nothing), `WriteProcessMemory`
+//!   (always fails; `NtWriteVirtualMemory` works). Reads and faults are fine:
+//!   a fault reaches the vectored handler with the right address and kind. Code that
 //!   may meet a window asks [`bridged`] first, or uses the drop-ins
 //!   [`virtual_query`] and [`virtual_protect`], which answer for windows and
 //!   pass anything else to Wine unchanged.

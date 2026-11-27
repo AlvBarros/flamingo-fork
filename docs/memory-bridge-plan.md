@@ -250,12 +250,12 @@ before they start and never overlap (spikes use their own throwaway Wine prefixe
 
 | Item | Owner | Branch | State |
 |---|---|---|---|
-| WS0 contract | coordinator | `memory-bridge` | in progress |
-| S1 uffd WP-async + PAGEMAP_SCAN under Proton | agent | `memory-bridge-s1` | in progress |
-| S2 Wine's behaviour on the window | agent | `memory-bridge-s2` | in progress |
-| S3 external_memory_host on memfd (NVIDIA) | agent | `memory-bridge-s3` | in progress |
-| S4 cost of `__wine_unix_call` and batches | agent | `memory-bridge-s4` | in progress |
-| WS1-WS9 | — | — | waiting for spike results |
+| WS0 contract | coordinator | `memory-bridge` | done (1463fc3; MAP_WATCH and replace-in-place from S1/S4) |
+| S1 uffd WP-async + PAGEMAP_SCAN under Proton | agent | `memory-bridge-s1` | done, merged (5a8aa73): works, no blocker |
+| S2 Wine's behaviour on the window | agent | `memory-bridge-s2` | done, merged (21318ee): faults OK; 7 Wine calls must be intercepted |
+| S3 external_memory_host on memfd (NVIDIA) | agent | `memory-bridge-s3` | done, merged (301052b): yes, via `OpenExistingHeapFromAddress1` only |
+| S4 cost of `__wine_unix_call` and batches | agent | `memory-bridge-s4` | done, merged (81d59b4): ~5 ns a call; 180-340x Wine at 60k views |
+| WS1-WS9 | — | — | M0 reached; waiting for the go to start |
 
 ### Runs
 
@@ -265,7 +265,68 @@ before they start and never overlap (spikes use their own throwaway Wine prefixe
 
 ### WS0 results
 
-(pending)
+Done 2026-11-27 on `memory-bridge` (commit 1463fc3, plus the S1/S4 follow-ups in the same
+crate). What is fixed for everyone else:
+
+- `crates/victory-bridge/src/abi.rs` (authority) and `bridge/unix/abi.h` (mirror; a Rust test
+  checks its numbers, `_Static_assert`s its layout). One PE export, `victorybridge_call(u32 code,
+  void *args)`, forwarding to `__wine_unix_call`. Calls 0-10: `VERSION`, `POOL_CREATE/DESTROY`,
+  `WINDOW_ADD/REMOVE`, `MAP`, `UNMAP`, `PROTECT`, `WATCH_REGISTER`, `WATCH_TAKE`, `COPY`. Batches:
+  `{pool, ops*, count, results* (i32 errno per op), done}`, at most 4,096 ops per call (S4: no
+  minimum needed, results cost nothing). `MAP` is one `MAP_FIXED` mmap over whatever is there
+  (S4: 0.8-1.1 µs, no unmap first) and `MAP_WATCH` arms write tracking on the new view in the same
+  call (S1: a `MAP_FIXED` mmap drops earlier registrations). Protections are Linux `PROT_*` bits.
+- `crates/victory-bridge/src/lib.rs`: `available()`, `bridged(addr)`, `window_add/remove`,
+  `PagePool` + `Pool` (`create/map/unmap`, one call per batch), `unmap`, `protect`, `query` (from
+  the bridge's own map, `map.rs`, never Wine's), `watch_register`, `watch_take` (pages written
+  *through* the range; aliases are the caller's, S1), `copy`, and drop-ins `virtual_query` /
+  `virtual_protect` that answer for windows and pass anything else to Wine unchanged. The loader
+  looks for `victorybridge.dll` beside `victory.exe` under Wine only and checks the ABI version
+  (WS2's Rust side is therefore done; WS2 is the C PE half).
+- Off unless `VICTORY_BRIDGE` is set and not `0`; then still off without Wine, the DLL or the
+  right ABI version (a warning says so). Off, every function answers "not mine" and nothing
+  changes. `victory-hle` and `victory-gpu` depend on the crate; nothing calls it yet.
+- Tests: 19 in the crate (the map; the marshalling against a fake Unix half: batch splitting,
+  refusals, map kept in step, version check, missing features; the drop-ins passing other memory
+  through, Windows only). Natively and under Proton.
+- Found on the way, fixed in a separate commit (9d6f4df): two stale test call sites in
+  `victory-gpu` (`descriptor.rs`) and `victory-shader` (`valu_tests.rs`) stopped the suite from
+  compiling on this base. Not fixed: `scripts/linux/build.sh` (and so `test.sh`) defaults to the
+  `victory-hle/keys` feature this base lacks; tests run with `FORK_FEATURES=""`.
+
+### M0: what the spikes decide (coordinator's summary)
+
+- **Go.** Nothing blocks the bridge: uffd async works under Proton (S1), faults in the window
+  reach our handler and safecopy works unchanged (S2), the bridge maps 180-340x faster than Wine at
+  60,000 views and a unix call costs ~5 ns (S4), and the GPU imports bridge memory (S3).
+- **WS1** (Unix half): one `MAP_FIXED` mmap per `MAP` op, register + arm per view when
+  `MAP_WATCH` (+0.75 µs); scan with `PM_SCAN_WP_MATCHING`, category `PAGE_IS_WRITTEN`, **never
+  `PM_SCAN_CHECK_WPASYNC`** (it loses writes on EPERM); retry on `EINTR` (a suspended thread is
+  frozen inside the call); hold no lock a suspended thread could leave held across a syscall that
+  can block for long; never fault in the Unix half (copies use `process_vm_readv`).
+- **WS2/WS9**: Wine finds a builtin's Unix half only through **`WINEDLLPATH`** naming the `.so`'s
+  directory (beside the `.dll` is not enough); `run.sh` must set it. vkd3d-proton's `d3d12core`
+  needs DXVK's `dxgi` in a fresh prefix (the game prefix has it already).
+- **WS3**: one bridge `MAP` call per xmem `change` on the calling thread (not the worker pool;
+  several mapping threads lose to the kernel's `mmap_lock`, S4); a remap is one `MAP` op (no
+  unmap, no placeholder split); per-op results kept for `change`'s `done`.
+- **WS4**: inside a window, these must never reach Wine (S2): `VirtualQuery` /
+  `NtQueryVirtualMemory`, `VirtualProtect` / `NtProtectVirtualMemory`, `VirtualAlloc(MEM_COMMIT)`
+  (Wine succeeds and then believes the pages are its own), `VirtualFree(MEM_DECOMMIT)` (replaces
+  our view), `VirtualFree(MEM_RELEASE)` (unmaps every view; only `window_remove` then Wine's
+  release), `GetWriteWatch` (sees nothing), `WriteProcessMemory` (always fails: use
+  `NtWriteVirtualMemory`). Our call sites and the title's imports.
+- **WS5**: per-view arming at map time (`MAP_WATCH`); `watch_take` scans only the asked ranges
+  (~0.45 ms per GiB); aliases fanned out from xmem's page table; private memory keeps
+  `GetWriteWatch` (Proton already does it with uffd async).
+- **WS6**: safecopy and the `ReadProcessMemory` fallback work as they are; `on_write`'s
+  `writable()` / `readable_view()` / `came_back` must ask `victory_bridge::query` for bridged
+  addresses (Wine says reserved there); `host.rs`'s `WriteProcessMemory` fallback must become
+  `NtWriteVirtualMemory`.
+- **WS7**: yes, but only through `OpenExistingHeapFromAddress1` (`From::Part`); plain
+  `OpenExistingHeapFromAddress` and `...FromFileMapping` cannot work on bridged memory (S2 and S3
+  agree). A failed host import silently falls back to an ordinary allocation in vkd3d-proton:
+  verify contents, not the open. Heaps pin pages: drop/re-open before the bridge remaps inside one.
 
 ### S1 results
 
