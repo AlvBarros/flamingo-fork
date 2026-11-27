@@ -1313,3 +1313,49 @@ batched path (one call per group). Nothing here turns them off automatically.
   The title's release of a piece of a window keeps it reserved until the whole is released.
 - **Not verified.** Anything against the real Unix half and DLL (emulator only); the bridge's speed
   in xmem's shape (batch sizes per frame); a game run.
+
+## 12. Next: WS5 brief (for any session to pick up)
+
+Branch `memory-bridge-foxhound-ws5` from `memory-bridge-foxhound`; commit there, the coordinator
+merges. Goal: the guards (64 KiB read-only blocks on title views + `watch::on_write` faults) and
+the protection changes go away for bridged views, replaced by uffd async write tracking.
+Measured on the bridge (§11): guard waits ~114 ms a frame over all threads (~5 on the frame's
+threads), 330 ms median in long frames; protections ~13 ms. Read first: §10 S1 results and "M0"
+(per-view arming at map time; scan only asked ranges; never `PM_SCAN_CHECK_WPASYNC`; aliases are
+reported only where written), §11 WS1 results (a take costs per VMA walked: take only what the
+watch asks, never the whole window), WS3 results (`MAP_WATCH` is set in the `MapOp` built in
+xmem's `bridge_map`; `Shown` maps pool pages to all their addresses, for fanning writes out to
+aliases), WS4 results (`watch::kernel_written` returns `None` for windows: "WS5: watch_take here").
+Steps: set `MAP_WATCH` for bridged title views; in `watch.rs`, for bridged ranges, skip guarding
+(`cover`/`open`/protect) and answer "what was written" with `victory_bridge::watch_take` over the
+asked range, fanned out to aliases via xmem; keep everything as is when not bridged. Tests both
+ways (`VICTORY_BRIDGE=0/1`, real DLL via `test.sh`), compare with the base's known failures.
+Check in the game with a 5-minute run (announce first in §11 Runs) and the frame log columns
+"guard waits", "protection changes", "write-watch askings". Don't run the game while another
+session does (`pgrep -f victory.exe`).
+
+## 13. Ray tracing: plan (later)
+
+The title traces indirect light, reflections and lamp/sun shadows in its own compute shaders
+(`docs/fork-ray-tracing.md`): its own node format, 52 builder programs, 64 trace programs; only
+the per-node test (`image_bvh*_intersect_ray`) is hardware, emulated here in DXIL. Off by default
+(`VICTORY_BVH_BUILDER`); the stand-in is `VICTORY_AMBIENT` (raised to 1.2 locally: everything
+off the sun's direct light is near black otherwise). Figures in that doc are upstream's (likely
+Windows): **measure our own under Proton before deciding anything**.
+
+1. **Measure (one 5-minute run, frame log on):** `VICTORY_BVH_BUILDER=1` under Proton on the
+   RTX 4070. Does it run, hang, or crash; fps; GPU time per frame by the builder, the traversal
+   (trace programs) and the emulated node test (needs per-pipeline GPU timing: add timestamp
+   queries around those dispatches, or use the frame log's pipeline columns), and the copies of
+   title memory the trace programs read by raw address.
+2. **If the emulated node test dominates:** hardware ray tracing through DXR 1.1 inline ray
+   queries (vkd3d-proton maps them to `VK_KHR_ray_query` on NVIDIA): convert the title's
+   structures (triangle and instance nodes hold the geometry) to DXR acceleration structures each
+   frame, and replace the traversal loops in the 64 trace programs with `RayQuery` returning the
+   title's hit form. Research-grade (pattern-matching traversal loops; keeping two sets of
+   structures in step); spike first on one trace program.
+3. **If memory copies dominate:** the bridge already attacks them (WS5 write tracking; WS7 heaps
+   in place on bridged memory through `OpenExistingHeapFromAddress1`, S3).
+4. **If the builder dominates:** look at refitting less often or caching the static world's
+   structures (they ship pre-built).
+Linux-only fork: no upstream route needed; keep the work isolated so pulling upstream stays easy.
