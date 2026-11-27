@@ -71,11 +71,15 @@ pub enum T {
     /// Windows calls xmem makes to change a mapping (unmap, split, map,
     /// commit), calls and nanoseconds; and the GPU side told of changes
     /// (`title_memory_remapped`, `_view`, `_unmapping`, `_made_real`), calls
-    /// and nanoseconds. Summed over threads.
+    /// and nanoseconds; the memory bridge's calls xmem makes instead of the
+    /// Windows calls (`VICTORY_BRIDGE`; a batch of views each), calls and
+    /// nanoseconds. Summed over threads.
     XmemCalls,
     XmemNs,
     RemapOsCalls,
     RemapOsNs,
+    RemapBridgeCalls,
+    RemapBridgeNs,
     RemapNotes,
     RemapNoteNs,
     /// The memory watch's system calls (`crate::watch`), on every thread:
@@ -476,7 +480,7 @@ fn text(f: &Frame) -> String {
          {:.1} ms {:.1} MB; copy-back {:.1} ms {:.2} MB | card: idle {:.1} ms ({:.1} behind us) | all submit calls {:.1} ms \
          | textures: refresh {:.1} ms ({:.1} waiting for another thread's refresh, {:.1} asking the watch, {:.1} waiting \
          for memory to hold still), {:.0} uploads | remapping: {:.0} calls {:.1} ms ({:.1} waiting for readers) | xmem: \
-         {:.0} mapping calls {:.1} ms; Windows calls {:.0} {:.1} ms; the GPU side told {:.0} {:.1} ms | memory watch, all \
+         {:.0} mapping calls {:.1} ms; Windows calls {:.0} {:.1} ms; bridge calls {:.0} {:.1} ms; the GPU side told {:.0} {:.1} ms | memory watch, all \
          threads: {:.0} write-watch askings ({:.0} refused) {:.1} ms over {:.0} MB; {:.0} protection changes {:.1} ms; {:.0} \
          region queries {:.1} ms; waits for the guards {:.0} {:.1} ms, for its other locks {:.1} ms; {:.0} guard faults | \
          memory watch, the frame's threads: asking {:.1} ms, protecting {:.1} ms, querying {:.1} ms, guard-waiting {:.1} ms, \
@@ -512,6 +516,8 @@ fn text(f: &Frame) -> String {
         ns_ms(T::XmemNs),
         t(T::RemapOsCalls),
         ns_ms(T::RemapOsNs),
+        t(T::RemapBridgeCalls),
+        ns_ms(T::RemapBridgeNs),
         t(T::RemapNotes),
         ns_ms(T::RemapNoteNs),
         t(T::WatchAsks),
@@ -828,6 +834,8 @@ mod tests {
         f.t[T::XmemNs as usize] = 40_000_000.0;
         f.t[T::RemapOsCalls as usize] = 2_100.0;
         f.t[T::RemapOsNs as usize] = 31_500_000.0;
+        f.t[T::RemapBridgeCalls as usize] = 40.0;
+        f.t[T::RemapBridgeNs as usize] = 2_500_000.0;
         f.t[T::WatchAsks as usize] = 90.0;
         f.t[T::WatchNs as usize] = 4_500_000.0;
         f.t[T::WatchBytes as usize] = 64e6;
@@ -844,7 +852,7 @@ mod tests {
         let line = text(&f);
         for want in [
             "remapping: 12 calls 45.6 ms",
-            "xmem: 3 mapping calls 40.0 ms; Windows calls 2100 31.5 ms",
+            "xmem: 3 mapping calls 40.0 ms; Windows calls 2100 31.5 ms; bridge calls 40 2.5 ms",
             "memory watch, all threads: 90 write-watch askings (0 refused) 4.5 ms over 64 MB",
             "400 protection changes 2.0 ms",
             "50 region queries 1.0 ms",

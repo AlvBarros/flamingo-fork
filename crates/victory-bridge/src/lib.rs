@@ -40,6 +40,8 @@
 //! The ABI is in [`abi`] (mirrored in `bridge/unix/abi.h`).
 
 pub mod abi;
+#[cfg(all(windows, any(test, feature = "emulate")))]
+pub mod emulate;
 pub mod map;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -263,9 +265,23 @@ impl std::fmt::Debug for Bridge {
     }
 }
 
+/// A bridge put in place by [`install`] (tests: `emulate`); it wins over
+/// the one [`load`] finds.
+static INSTALLED: OnceLock<Bridge> = OnceLock::new();
+
 fn bridge() -> Option<&'static Bridge> {
     static BRIDGE: OnceLock<Option<Bridge>> = OnceLock::new();
-    BRIDGE.get_or_init(load).as_ref()
+    INSTALLED
+        .get()
+        .or_else(|| BRIDGE.get_or_init(load).as_ref())
+}
+
+/// Makes `entry` the bridge for the rest of the process, whatever
+/// `VICTORY_BRIDGE` says (an emulated Unix half for tests). False when one
+/// was installed already or `entry` speaks another ABI version.
+#[cfg_attr(not(all(windows, any(test, feature = "emulate"))), allow(dead_code))]
+fn install(entry: Entry) -> bool {
+    Bridge::new(entry).is_some_and(|b| INSTALLED.set(b).is_ok())
 }
 
 fn load() -> Option<Bridge> {
