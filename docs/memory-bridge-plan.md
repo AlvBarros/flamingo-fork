@@ -595,6 +595,9 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
 - 2026-11-27 ~12:10: another session is running `flamingo-main` (prebuild, then a 10-minute play
   run, prefix `flamingo-fork-foxhound`). No run of ours meanwhile; its log, with this base's
   current settings, is the re-scope's first data.
+- 2026-11-27 (this session): **run announced** — `memory-bridge-foxhound` at 76498ca (WS8 frame
+  log, `VICTORY_FRAME_LOG=1`, `VICTORY_BRIDGE` unset), `play.env` as committed, unattended
+  (`FORK_KEYS`), up to 11 min, home `flamingo-fork-foxhound` (warm caches, as the 11:12 run).
 
 ### Re-scope
 
