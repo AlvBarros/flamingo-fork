@@ -346,7 +346,60 @@ registration would silently drop on Wine's decommit/recommit. No blocker found.
 
 ### S2 results
 
-(pending)
+2026-11-27, Proton Experimental (wine-11.0 base, vkd3d-proton 3.2.0 build 2576c0b), RTX 4070,
+own throwaway prefix; `tools/bridge-spike/s2/` (code, build/run, full table). A 16 MiB window
+reserved through Wine; the Unix half maps memfd views, unmaps to anonymous PROT_NONE and
+`mprotect`s inside it. All checks pass; `WINEDEBUG=+seh,+virtual` confirms what Wine does.
+
+| Operation on the window | What Wine does | Verdict |
+|---|---|---|
+| write to a view `mprotect`ed read-only | one `EXCEPTION_ACCESS_VIOLATION` to the first vectored handler, `info[0]=1`, `info[1]` = exact byte; nothing first (no guard-page, stack or write-watch handling). Handler `mprotect`s through the Unix half + `CONTINUE_EXECUTION`: the write lands. Same on a second thread, 8 threads at once, RIP inside the window | OK |
+| read of an unmapped (PROT_NONE) or never-mapped window page | AV, `info[0]=0`, exact address; handler maps the view, the read sees the pool | OK |
+| safecopy's `rep movsb` + handler | from a view: no fault; into an unmapped page: AV at the first missing byte, failing exit works; into a read-only view: handler opens it, copy completes | OK |
+| `VirtualQuery` / `NtQueryVirtualMemory(MemoryBasicInformation)` | `MEM_RESERVE`, `Protect=0`, `AllocationProtect=PAGE_NOACCESS`, `AllocationBase` = window, region = queried page to window end, whatever is mapped; `MemoryWorkingSetExInformation`: not valid | must intercept (WS4) |
+| `ReadProcessMemory` / `NtReadVirtualMemory`, own process | memcpy of the real pages under Wine's syscall fault handler: RW and R views read right; unmapped fails `STATUS_PARTIAL_COPY` (299); destination in the window works | OK |
+| `NtWriteVirtualMemory`, own process | real pages: RW view lands; R view and unmapped fail `STATUS_PARTIAL_COPY` | OK |
+| `WriteProcessMemory` | always `ERROR_NOACCESS` (998), even for an RW view: kernelbase asks `VirtualQuery` first and sees reserved | must intercept (use `NtWriteVirtualMemory` or the bridge) |
+| `process_vm_readv` in the Unix half | views read; unmapped `EFAULT` | OK (WS6 bulk path) |
+| `WriteFile` from / `ReadFile` into a view | mapped views work, data right; unmapped source `ERROR_INVALID_USER_BUFFER`, read-only/unmapped destination `ERROR_NOACCESS`; no fault, nothing remapped | OK (as Windows) |
+| `IsBadReadPtr` / `IsBadWritePtr`, memcpy on 6 threads | probe the real protection (our handler sees the probe's AV first and must decline it); memcpy fine | OK |
+| `GetWriteWatch` | window without `MEM_WRITE_WATCH`: `ERROR_INVALID_PARAMETER`; a `MEM_WRITE_WATCH` reserve with a written bridge view: 0 pages | must intercept (WS5: uffd) |
+| `VirtualProtect` on the window | fails `ERROR_INVALID_ADDRESS` (not committed); view untouched | must intercept |
+| `VirtualAlloc(MEM_RESERVE)` at a window address | fails (already reserved) | OK |
+| `VirtualAlloc(MEM_COMMIT)` on a view | **succeeds**: Wine marks the pages committed and `mprotect`s our mapping (bytes kept); afterwards Wine's `VirtualProtect` there succeeds and `mprotect`s our memfd mapping, and Wine's view and ours disagree | must intercept |
+| `VirtualFree(MEM_DECOMMIT)` on a view | **succeeds, replaces our view with anonymous PROT_NONE** (pool bytes stay in the memfd) | must intercept |
+| `VirtualFree(MEM_RELEASE)` of the window | **succeeds, munmaps every view**; the next `VirtualAlloc` lands there | must intercept; only the bridge releases its window |
+| `SuspendThread` / `GetThreadContext` on a thread inside the Unix call | answer at once (0.1-0.3 ms); context is the PE side (dispatcher return). The thread is frozen **inside** the Unix call (signal): it stops mid-batch, its syscalls get `EINTR`, it finishes after the resume | OK with care (WS1) |
+| D3D12: memcpy from 16 read-only bridge views into an upload buffer, copy to default, read back | bytes equal | OK |
+| `ID3D12Device3::OpenExistingHeapFromAddress` on a bridge view | `E_INVALIDARG` (vkd3d-proton sizes it with `VirtualQuery` and sees reserved); control on `VirtualAlloc`'d memory works | blocker for WS7 as is (see S3) |
+
+Run note for WS2/WS9: Wine finds a builtin's Unix half only through `WINEDLLPATH` (the directory
+holding the `.so`); without it `NtQueryVirtualMemory(MemoryWineUnixFuncs)` fails and the bridge
+must report itself unavailable. (The first spike's `load.exe` also needs it.)
+
+**Decides.** WS4: inside the window every Wine answer about state is wrong (reserved, no access),
+and three calls actively damage it, so the bridge must answer or refuse, for any address with
+`bridged(addr)`: `VirtualQuery` / `NtQueryVirtualMemory` (basic and working-set classes),
+`VirtualProtect` / `NtProtectVirtualMemory`, `VirtualAlloc(MEM_COMMIT)` (must not reach Wine:
+it `mprotect`s our views and makes Wine think the pages are committed), `VirtualFree(MEM_DECOMMIT)`
+and `VirtualFree(MEM_RELEASE)` (they destroy views: answer from the bridge, release the window
+only when the pool goes), `GetWriteWatch` / `NtGetWriteWatch` (WS5), `WriteProcessMemory` (fails;
+use `NtWriteVirtualMemory`). This covers our own sites and the title's imports bound by
+`victory-loader`; anything else in the process (vkd3d-proton's `OpenExistingHeapFromAddress`,
+other DLLs) still sees reserved, so in-place heaps stay off bridged ranges until WS7/S3. Calls
+that need no interception: faults, `ReadProcessMemory` / `NtReadVirtualMemory`,
+`NtWriteVirtualMemory`, file I/O, `IsBad*Ptr`, `VirtualAlloc(MEM_RESERVE)` (refused). WS6: safecopy's
+`rep movsb` + vectored-handler design works unchanged on bridge pages (AV with exact address and
+read/write flag, `CONTINUE_EXECUTION` after a bridge `mprotect`/map, RIP redirect to the failing
+exit), and the `ReadProcessMemory` fallback (`VICTORY_SAFE_COPY=0`) and `host.rs`'s
+`NtWriteVirtualMemory` work too, because Wine copies the real pages; only the `WriteProcessMemory`
+fallback in `host.rs` fails. But `on_write`'s own checks `writable()`, `readable_view()` (and so
+`came_back`) use `VirtualQuery`, which always says reserved there: they must ask
+`victory_bridge::query` when bridged, or the handler sends those faults to `CONTINUE_SEARCH`.
+WS1: a thread can be suspended in the middle of a Unix call, so the Unix half must retry on
+`EINTR`, and must not hold a lock that a suspending thread could then wait for in its own bridge
+call (or must make batches restartable); it must never fault itself (not tested here; Wine
+does not hand a fault in Unix code to our handler as an ordinary AV), so copies that may meet an unmapped page use `process_vm_readv`.
 
 ### S3 results
 
