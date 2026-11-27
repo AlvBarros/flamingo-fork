@@ -18,6 +18,8 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
     // Linux fork: the run settings (scripts/linux/play.env) and the A/B scripts.
     "env", "py",
+    // The memory bridge's C halves (tools/bridge-spike, bridge/).
+    "c", "h",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
