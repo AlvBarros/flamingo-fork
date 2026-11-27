@@ -429,8 +429,14 @@ impl Bridge {
             .map(|&f| f && sent.next().unwrap_or(false))
             .collect();
         let mut m = self.map_write();
-        for (op, _) in ops.iter().zip(&done).filter(|(_, d)| **d) {
-            m.map(op.addr, op.len, pool.id, op.offset, op.prot);
+        for ((op, fits), done) in ops.iter().zip(&fits).zip(&done) {
+            if *done {
+                m.map(op.addr, op.len, pool.id, op.offset, op.prot);
+            } else if *fits {
+                // Sent and failed: a failed MAP_FIXED may already have
+                // dropped what was there (WS1), so it is unmapped now.
+                m.unmap(op.addr, op.len);
+            }
         }
         done
     }

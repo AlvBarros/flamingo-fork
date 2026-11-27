@@ -164,7 +164,45 @@ impl Map {
         for (a, s) in inside {
             self.segs.insert(a, f(s, a - addr));
         }
+        self.join(addr, addr + len);
         true
+    }
+
+    /// Joins the segments of `[from, to)` and its two neighbours that
+    /// continue each other, so a run is one segment and [`Map::query`] one
+    /// lookup (WS4: 60,000 views of consecutive pool bytes left as 60,000
+    /// segments cost 132 µs a query, 50x Wine's).
+    fn join(&mut self, from: usize, to: usize) {
+        let start = self
+            .segs
+            .range(..from)
+            .next_back()
+            .map_or(from, |(a, _)| *a);
+        let mut at = start;
+        while let Some(&seg) = self.segs.get(&at) {
+            let next_at = at + seg.len;
+            match self.segs.get(&next_at).copied() {
+                Some(next) if seg.continued_by(&next) => {
+                    self.segs.remove(&next_at);
+                    self.segs.insert(
+                        at,
+                        Seg {
+                            len: seg.len + next.len,
+                            ..seg
+                        },
+                    );
+                }
+                _ if next_at > to => break,
+                Some(_) => at = next_at,
+                None => break,
+            }
+        }
+    }
+
+    /// Segments, for tests.
+    #[cfg(test)]
+    fn segments(&self) -> usize {
+        self.segs.len()
     }
 
     /// A view of `pool` from `offset` at `[addr, addr + len)`.
@@ -252,6 +290,35 @@ mod tests {
         let mut m = Map::default();
         assert!(m.add_window(W, 16 * K64));
         m
+    }
+
+    /// Views mapped one by one over consecutive pool bytes become one
+    /// segment, and unmapping them again one by one leaves one: a query is a
+    /// lookup, not a walk (WS4's 132 µs at 60,000 views).
+    #[test]
+    fn runs_are_joined_so_a_query_does_not_walk() {
+        let mut m = Map::default();
+        let n = 60_000;
+        assert!(m.add_window(W, n * K64));
+        for i in 0..n {
+            assert!(m.map(W + i * K64, K64, 3, (i * K64) as u64, Prot::READ_WRITE));
+        }
+        assert_eq!(m.segments(), 1);
+        let started = std::time::Instant::now();
+        let r = m.query(W + 5 * K64).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(1));
+        assert_eq!(r.len, (n - 5) * K64);
+        for i in 0..n {
+            assert!(m.unmap(W + i * K64, K64));
+        }
+        assert_eq!(m.segments(), 1);
+        assert_eq!(m.query(W).unwrap().len, n * K64);
+        // An alias in the middle splits the run in three, and goes again.
+        assert!(m.map(W, 3 * K64, 3, 0, Prot::READ_WRITE));
+        assert!(m.map(W + K64, K64, 3, 0, Prot::READ_WRITE));
+        assert_eq!(m.query(W).unwrap().len, K64);
+        assert!(m.map(W + K64, K64, 3, K64 as u64, Prot::READ_WRITE));
+        assert_eq!(m.query(W).unwrap().len, 3 * K64);
     }
 
     #[test]

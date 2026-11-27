@@ -210,9 +210,18 @@ fn ops_outside_windows_or_pools_are_refused_without_a_call() {
 }
 
 #[test]
-fn a_failed_op_leaves_the_map_as_it_was() {
+fn a_failed_op_leaves_its_range_unmapped() {
     let b = bridge();
     let pool = b.pool(64 * K64 as u64).unwrap();
+    // A view there first: a failed MAP_FIXED over it may have dropped it.
+    let first = MapOp {
+        watch: false,
+        addr: W + K64,
+        len: K64,
+        offset: 9 * K64 as u64,
+        prot: Prot::READ,
+    };
+    assert_eq!(b.map(&pool, &[first]), vec![true]);
     SEEN.with_borrow_mut(|s| s.fail_at.push((W + K64) as u64));
     let ops = [
         MapOp {
@@ -231,7 +240,15 @@ fn a_failed_op_leaves_the_map_as_it_was() {
         },
     ];
     assert_eq!(b.map(&pool, &ops), vec![true, false]);
-    assert_eq!(b.query(W + K64).unwrap().kind, Kind::Unmapped);
+    assert_eq!(
+        b.query(W).unwrap().kind,
+        Kind::View {
+            pool: 42,
+            offset: 0
+        }
+    );
+    let r = b.query(W + K64).unwrap();
+    assert_eq!((r.kind, r.prot), (Kind::Unmapped, Prot::NONE));
     std::mem::forget(pool);
 }
 
