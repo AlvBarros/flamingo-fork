@@ -586,8 +586,8 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
 
 | Item | Owner | Branch | State |
 |---|---|---|---|
-| Re-scope: where do this base's slow frames go | coordinator | `memory-bridge-foxhound` | in progress |
-| WS8 frame log ported to this base | agent | `memory-bridge-foxhound-ws8` | in progress |
+| Re-scope: where do this base's slow frames go | coordinator | `memory-bridge-foxhound` | measured (frame log run 13:24); decision pending |
+| WS8 frame log ported to this base | agent | `memory-bridge-foxhound-ws8` | done, merged (76498ca) |
 | WS1-WS7, WS9 | — | — | waiting for the re-scope |
 
 ### Runs
@@ -614,6 +614,25 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
   First reading: write tracking (guards + protections + askings, ~50 ms a frame summed over
   threads at the median) is what is left of Wine's memory costs, i.e. **WS5 still pays; WS3 (xmem
   remapping) likely does not**. To confirm per long frame with the WS8 frame log before starting.
+
+- **Measured with the WS8 frame log** (`logs/20261127-132421-play.log`, 76498ca + doc, 11 min
+  unattended, warm, no crash; `ab_runs.py`, cutscene stretch 60-480 s, 7,463 frames): frame mean
+  56 ms, median 55, p90 68, **p99 81, max 483; none over 250 ms; 35 long frames, 1.1% of the
+  time**. This base no longer stutters the way §1 describes; what is left is throughput.
+  - Usual frame (55.6 ms): present 18.5 ms, preparing 34.2 (copies 24.0 ms, 34 MB), card idle
+    13.2 (11.4 of it behind us). Memory costs, **summed over all threads**: waits for the guards
+    74.9 ms (804 waits), region queries 28.6 ms (**11,143 `VirtualQuery` a frame**), protection
+    changes 9.2 ms (553), write-watch askings 3.9 ms (434, 1.97 GB asked), 319 guard faults;
+    remapping 1.0 ms (soft views).
+  - Long frames (median 115 ms): remapping bursts (median 97 calls, 50 ms; 59 Windows calls,
+    36 ms: soft views made real), region queries 203 ms, guard waits 178 ms, copies 90 ms. The
+    35 long frames hold 26% of all remap calls and 32% of the Windows mapping calls.
+  - What the bridge could still take, by workstream: **WS5** (guards, protections, write watch:
+    ~88 ms a frame over threads, the largest) and **WS4** (region queries: 29 ms a frame; for
+    bridged memory answered from the bridge's own map, no Wine lock); **WS3** only for the long
+    frames' remapping bursts (1% of the time). Not yet known: how much of the summed waits lies
+    on the submitting/render thread's critical path (the log sums threads; the frame is bound by
+    preparing 34 ms + present 18.5 ms). No switch turns the guards off for a cheap upper bound.
 
 ### WS8 results (foxhound base)
 
