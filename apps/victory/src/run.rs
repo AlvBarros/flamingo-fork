@@ -203,6 +203,12 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    #[cfg(windows)]
+    {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
+    }
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);

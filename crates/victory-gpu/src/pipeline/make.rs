@@ -150,9 +150,23 @@ impl Pending {
 
     fn make(&self) {
         self.made.get_or_init(|| {
+            // Linux fork: shaders the host driver hangs on (`VICTORY_SKIP_PIPELINES`)
+            // are never compiled; the draw-time skip alone left the compile running,
+            // and each held a pipeline worker for good (7 of 8, run 20261127-083807).
+            if let Some(h) = self.shaders.iter().find(|s| skip_listed(&s.hash)) {
+                tracing::warn!(hash = %h.hash, "host pipeline not made: VICTORY_SKIP_PIPELINES");
+                return None;
+            }
             let began = Instant::now();
+            // Linux fork, local diagnostic: which makes never end (a driver
+            // hang holds the worker for good).
+            tracing::info!(shaders = ?self.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect::<Vec<_>>(), "pipeline make begins");
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-            super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            let ms = began.elapsed().as_millis() as u64;
+            super::library::note_time(&self.key, ms);
+            if ms > 2000 {
+                tracing::info!(ms, shaders = ?self.shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect::<Vec<_>>(), "pipeline make ended (slow)");
+            }
             made
         });
         let (lock, done) = &DONE;
@@ -752,4 +766,20 @@ mod tests {
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
     }
+}
+
+/// Whether `hash` is on `VICTORY_SKIP_PIPELINES` (16-digit shader hashes,
+/// commas between), read once.
+fn skip_listed(hash: &str) -> bool {
+    static LIST: OnceLock<Vec<String>> = OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_PIPELINES")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| h.len() == 16)
+            .collect()
+    })
+    .iter()
+    .any(|h| h == hash)
 }
