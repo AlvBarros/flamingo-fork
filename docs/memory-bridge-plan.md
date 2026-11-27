@@ -603,3 +603,11 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
   them write tracking was still large: per frame, all threads, median / p90: kernel askings
   6-9 / 80-160 ms, waits for the guards 11-12 / 56-90 ms, protection changes 7-9 / 43-45 ms; on
   the submitting thread 4-5 / 36-46 ms asking the write watch; copies 22-25 / 250-885 ms.
+- **This base, tuned settings** (`logs/20261127-111246-play.log`, another session's run, soft
+  views on, 1080p; whole run, periodic per-frame averages, not yet the cutscene stretch alone):
+  frame median 64 ms, mean 119, p90 207, max 1.9 s. Per frame, all threads, median / p90: **waits
+  for the guards 32 / 144 ms** (max 906), protection changes 11 / 41 ms, kernel askings 5 / 49 ms,
+  refreshes' watch+guards 4 / 39 ms; copies 32 / 129 ms. Remapping no longer shows (soft views).
+  First reading: write tracking (guards + protections + askings, ~50 ms a frame summed over
+  threads at the median) is what is left of Wine's memory costs, i.e. **WS5 still pays; WS3 (xmem
+  remapping) likely does not**. To confirm per long frame with the WS8 frame log before starting.
