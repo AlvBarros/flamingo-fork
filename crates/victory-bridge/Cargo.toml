@@ -1,0 +1,22 @@
+[package]
+name = "victory-bridge"
+description = "The memory bridge (Linux under Wine/Proton only): the title's page pools, views, protections and write tracking done with Linux calls by a Wine builtin DLL's Unix half, behind VICTORY_BRIDGE (off by default). Everywhere else: stubs that leave the present path in charge."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
+
+[lints]
+workspace = true
