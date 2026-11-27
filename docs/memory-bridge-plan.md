@@ -1,0 +1,213 @@
+# Memory bridge: plan (Linux fork)
+
+Status: plan, 2026-11-27. Base: this repository's `main` (trustno1-coder/VIctory-NVIDIA with the
+Linux fork's scripts and fixes). Written to be picked up by separate sessions or agents: each
+workstream below states what it owns, what it may assume and how it is checked.
+
+## 1. Why
+
+On an RTX 4070 under Proton the game runs at 16-17 fps when nothing streams (cutscene, ~4,900
+draws, frame median 58 ms), but about one moment in six takes 250 ms to 5 s. In those frames the
+copies of title memory slow from ~1.7 GB/s to ~0.12 GB/s (2026-11-27 session: 918 ms for 109 MB
+against 46 ms for 78 MB). The bytes are the same; the cost is Wine's bookkeeping of the title's
+memory, which grows with the number of views the title maps (~60,000):
+
+| Operation (measured on this PC) | Proton's Wine | Native Linux |
+|---|---|---|
+| Map + unmap a 64 KiB view at 60,000 views | 337 µs (16 µs with none) | 1.9 µs |
+| Change of protection, 6 other threads busy | 6.4 µs | 0.15 µs |
+| Map + unmap through the bridge spike, under Proton | — | 1.5 µs |
+
+Wine keeps its own list of views and one lock over it; every `MapViewOfFile3`,
+`UnmapViewOfFile2`, `VirtualFree` (placeholder split), `VirtualProtect`, `VirtualQuery` and
+`GetWriteWatch` goes through it. Valve's Proton work does not change this and we do not rebuild
+Proton.
+
+## 2. The idea
+
+A Wine **builtin DLL** with a **Unix half** (`__wine_unix_call`), loaded by `victory.exe` at start.
+Its Unix half does the title's page pool and views with Linux calls directly:
+
+- the pool of physical pages: one `memfd` (instead of a `SEC_COMMIT` section);
+- a view: `mmap(MAP_FIXED | MAP_SHARED, memfd, offset)` over address space Wine holds reserved;
+- an unmap: `mmap(MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, PROT_NONE)` (the range stays ours);
+- protections: `mprotect`;
+- write tracking: `userfaultfd` write-protect in asynchronous mode plus `PAGEMAP_SCAN`
+  (`PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC`): the kernel clears a page's write-protect bit on
+  the first write without any fault, and one scan returns and re-arms the written pages. It works
+  on shared views, so the 64 KiB guards and the vectored handler's faults go away for them;
+- many operations per call (a frame's remapping is ~2,100 calls today).
+
+Wine sees one reserved range and nothing inside it changes for Wine. Proven so far
+(`tools/bridge-spike/`): such a DLL, built with MinGW + gcc + Wine's `winebuild`, loads and runs
+under **Proton Experimental's Wine** (and system Wine 11.22), and its Unix half maps a memfd over a
+range reserved through Wine (1.5 µs per map+unmap). This kernel (6.18) has userfaultfd write-protect
+in async mode and `PAGEMAP_SCAN`; `vm.unprivileged_userfaultfd` is 0, so the bridge opens it with
+`UFFD_USER_MODE_ONLY`.
+
+What the bridge does not change: everything else Wine does (Valve's work stays), the title's own
+code, the GPU side's translation, the Windows build (the bridge is optional and off on Windows).
+
+## 3. Where the title's memory goes through Wine today (this tree)
+
+| Place | What | Calls |
+|---|---|---|
+| `crates/victory-hle/src/modules/xmem.rs` (2,551 lines) | physical page pool (`CreateFileMapping`, `SEC_COMMIT` under Wine), views (`map`/`show`/`split`/`unmap`, lines ~1599-1760: `MapViewOfFile3` with `MEM_REPLACE_PLACEHOLDER`, `VirtualFree` `MEM_PRESERVE_PLACEHOLDER`, `UnmapViewOfFile2`), batches (`change`, `Op`, a worker pool), aliases (`map_alias(es)`, `scatter`), the page table (`Pages`, `Shown`), costs (`map_costs`) | the remapping |
+| `crates/victory-gpu/src/watch.rs` (4,385 lines) | write watch for private title memory (`GetWriteWatch` resets as it asks), 64 KiB guards on views (`VirtualProtect` read-only + vectored handler `on_write`, line ~2565), every-view guarding (`VICTORY_VIEW_GUARD`, now 0 here), `NtQueryVirtualMemory` / `VirtualQuery` | the watch |
+| `crates/victory-gpu/src/safecopy.rs` | copies that fail instead of faulting: one `rep movsb`, faults taken by `watch::on_write`; `VICTORY_SAFE_COPY=0`: `ReadProcessMemory` | the copies |
+| `crates/victory-gpu/src/inplace.rs` | heaps opened on title memory (`OpenExistingHeapFromAddress(1)`, `...FromFileMapping`): while one stands Wine refuses `VirtualFree`/`VirtualProtect`/unmap there | in place |
+| `shadow.rs`, `upload.rs`, `host.rs`, `texture.rs`, `copystat.rs` | queries and copies around the above | |
+| title imports | the title's own `VirtualAlloc/Free/Protect/Query` on its memory (bound by `victory-loader`) | rare, but must stay right |
+
+## 4. Workstreams
+
+Contract first (WS0), then WS1-WS9 in parallel, then milestones in order. Every workstream keeps
+the present path as the fallback (`VICTORY_BRIDGE=0`, and always on Windows), so `main` is never
+broken by a half-done workstream.
+
+### WS0 — the contract (serial, first; 1-2 days, one person)
+
+Writes `crates/victory-bridge/` with the interface every other workstream codes against, plus
+stubs that call the present Windows path:
+
+```rust
+pub trait PagePool {                       // one per xmem physical pool
+    fn create(bytes: u64) -> Option<Self> where Self: Sized;
+    fn map(&self, ops: &[MapOp]) -> Vec<bool>;   // view at addr, len, pool offset, prot
+    fn unmap(&self, ranges: &[(usize, usize)]);   // back to reserved, ours
+}
+pub fn protect(ranges: &[(usize, usize, Prot)]) -> bool;
+pub fn query(addr: usize) -> Option<Region>;      // from our range map, not Wine's
+pub fn watch_register(addr: usize, len: usize) -> bool;
+pub fn watch_take(addr: usize, len: usize, out: &mut Vec<usize>) -> bool; // written pages, re-armed
+pub fn bridged(addr: usize) -> bool;              // is this range the bridge's
+pub fn available() -> bool;                       // DLL loaded, VICTORY_BRIDGE not 0
+```
+
+The unix-call ABI (function numbers, argument structs, `#[repr(C)]`, batch layout) is fixed in
+`crates/victory-bridge/src/abi.rs` and mirrored in `bridge/unix/abi.h`. Also fixed here: the
+reserved window (one `VirtualAlloc(MEM_RESERVE)` per title pool range, made by xmem through Wine
+so Wine never places anything inside), and the rule that **only the bridge** changes pages inside it.
+
+Done when: the crate builds for Windows, the stubs pass xmem's and watch's existing tests unchanged.
+
+### WS1 — the Unix half (independent; ~1 week)
+
+`bridge/unix/` (C or a Rust `cdylib` for `x86_64-unknown-linux-gnu`) exporting
+`__wine_unix_call_funcs`: pool create/destroy (memfd), batched map/unmap, mprotect, uffd setup
+(`UFFD_USER_MODE_ONLY`, `UFFD_FEATURE_WP_ASYNC`, `UFFDIO_REGISTER_MODE_WP`), `PAGEMAP_SCAN` take,
+`process_vm_readv` copy. Tested natively on Linux (no Wine) with a C/Rust test harness: correctness
+(aliases see each other's writes, unmap leaves PROT_NONE, scan finds exactly the written pages,
+re-arm works, many views), and speed at 60,000 views.
+
+### WS2 — the PE half and loading (independent; 3-4 days)
+
+`bridge/pe/` (MinGW C, as the spike) or a Rust `cdylib` for the Windows target marked builtin with
+`winebuild --builtin`: `DllMain` gets the unix handle (`NtQueryVirtualMemory(MemoryWineUnixFuncs)`),
+exports thin functions per ABI entry. `victory-bridge` loads it with `LoadLibraryW` from beside
+`victory.exe`, checks an ABI version call, and falls back if anything is missing. Unit test: the
+spike's `load.c` turned into a test that runs under Proton.
+
+### WS3 — xmem on the bridge (needs WS0; ~1 week)
+
+`xmem.rs`: the physical pool becomes a `PagePool`; `show`/`split`/`unmap`/`commit` and `change`'s
+batches go through it (one bridge call per batch, not per view); aliases (`map_alias(es)`,
+`scatter`) likewise. The page table, `Shown`, `title_memory_remapped` / `title_memory_view` notices
+stay as they are. `map_costs` counts bridge calls too. Existing tests (`physical_pages_map_alias_and_unmap`,
+`a_read_in_place_never_meets_the_gap_of_a_remapping`, `pages_mapped_again_hold_what_they_held`, ...)
+run against both paths.
+
+### WS4 — queries and protections that must not ask Wine (needs WS0; ~1 week)
+
+Inside the bridge's window Wine's answers are wrong (it sees reserved, no access). Classify every
+`VirtualQuery` (40 sites), `VirtualProtect` (51), `NtQueryVirtualMemory`, `ReadProcessMemory` (8)
+site as *title memory* or *our own*; title-memory ones ask `victory_bridge::query/protect` when
+`bridged(addr)`. The title's own imports of `VirtualQuery/VirtualProtect/VirtualFree` get thin
+wrappers bound by `victory-loader` that do the same. Deliverable includes the classified list in the
+PR description.
+
+### WS5 — write watch without guards (needs WS0, spike S1; ~1-2 weeks)
+
+`watch.rs`: for bridged views, replace the 64 KiB guards, `cover`/`open`, the every-view logic and
+the faults with `watch_register` at map time and `watch_take` where `GetWriteWatch` / the guard bits
+are read today; for private write-watched title memory, the same through uffd when bridged,
+`GetWriteWatch` otherwise. The journal (`ask`/numbering per asking) stays. `on_write` stays for
+what is not bridged and for safecopy.
+
+### WS6 — copies (needs WS0; 2-3 days)
+
+`safecopy.rs` keeps `rep movsb` + the handler (views are real pages); a fault inside the window
+must still reach `on_write` (Wine raises an access violation for a page it thinks reserved: check
+with S2). Optional `process_vm_readv` path for bulk copies.
+
+### WS7 — heaps in place (later; after M2)
+
+`inplace.rs` on bridged memory: vkd3d-proton imports host pointers through
+`VK_EXT_external_memory_host`; whether NVIDIA's driver takes a memfd-backed shared mapping is spike S3.
+Until then: no in-place heap on bridged ranges (`inplace` asks `bridged()`).
+
+### WS8 — measurement (independent, start now; 3-4 days)
+
+This tree has no per-frame memory counters (the Flamingo-based branch had them: "memory watch, all
+threads", "remapping: N calls M ms (Windows calls …)"). Port them (`crates/victory-gpu/src/framelog.rs` and xmem's `timed` wrapper
+from the `linux-on-new-upstream` branch) so each frame says: views mapped/unmapped and the
+time, protections and time, watch askings and time, copies MB and time. Extend
+`scripts/linux/ab_runs.py` to this tree's frame line. Baseline: the cutscene stretch and a walk,
+unattended (`FORK_KEYS`), three runs each.
+
+### WS9 — build and packaging (independent; 2 days)
+
+`scripts/linux/build.sh` builds the bridge (MinGW for the PE half, gcc/cargo for the Unix half,
+`winebuild --builtin`) and places `victorybridge.dll` + `victorybridge.so` beside `victory.exe`;
+`run.sh` prints whether it loaded; `VICTORY_BRIDGE=0` turns it off. The xtask policy and
+`.gitignore` know the new files.
+
+## 5. Spikes (do first, in parallel with WS0; half a day to a day each)
+
+| | Question | How | Decides |
+|---|---|---|---|
+| S1 | uffd WP-async + `PAGEMAP_SCAN` inside a Proton process, on memfd views and on anonymous private memory: works, and its cost at 60,000 views | extend `tools/bridge-spike` | WS5's design |
+| S2 | Wine's behaviour on our window: a fault there reaches our vectored handler as an access violation; `VirtualQuery` says reserved; Wine never touches the pages; vkd3d copies from it fine | spike program under Proton | WS4, WS6 |
+| S3 | `VK_EXT_external_memory_host` on a memfd mapping with NVIDIA 620 | small Vulkan test under Proton (`winevulkan`) | WS7 |
+| S4 | cost of one `__wine_unix_call`, and of batches | spike | batch sizes in WS0 |
+
+## 6. Milestones and go/no-go
+
+| | What | Check |
+|---|---|---|
+| M0 | WS0 + S1-S4 | contract merged; spikes answered |
+| M1 | remapping through the bridge (WS1, WS2, WS3, WS8, WS9) | frame log: remap time per frame 10x lower; stutter frames' copy rate up; no new stale data (`VICTORY_VERIFY`-style check on) |
+| M2 | write watch through uffd (WS5) | guards and their faults gone on views; watch time per frame down; picture unchanged |
+| M3 | queries/protections right everywhere (WS4, WS6) | a 30-minute session, no crash; the title's own memory calls served |
+| M4 | in place on bridged memory (WS7), if S3 allows | |
+
+Go/no-go after M1: if the stutter frames' copy rate does not rise severalfold, stop and measure
+where those frames go before M2. Each milestone lands on `main` behind `VICTORY_BRIDGE` (default
+off until M1 measures better, then on).
+
+## 7. Parallel plan
+
+```
+day 1-2   WS0 contract ─────────────┐   S1 S2 S3 S4 spikes (4 people/agents)   WS8 measurement   WS9 build
+day 3-8   WS1 unix half   WS2 PE half   WS3 xmem   WS4 queries   (WS8, WS9 finishing)
+day 8-12  M1 integration + measure ─── WS5 watch (from S1) ─── WS6 copies
+day 12-16 M2, M3; WS7 if S3 said yes
+```
+
+Up to five people or agents at once after WS0. Rules for parallel work: one branch per workstream
+off `main`; nothing outside the files a workstream owns changes without the WS0 owner; every PR
+keeps `VICTORY_BRIDGE=0` behaving exactly as before (tests run both ways); runs on the game are
+announced and never overlap (one Wine prefix).
+
+## 8. Risks
+
+- **Wine assumptions inside the window** (S2): if Wine reads or protects pages there behind our
+  back (e.g. on `NtReadVirtualMemory` from another thread, or exception handling), results are wrong.
+  Mitigation: the window holds only the title's xmem views; S2 checks the paths.
+- **uffd and Wine's signal handling**: async WP raises no fault, so no signal; the sync mode must not
+  be used.
+- **Two notions of "committed"**: Wine's commit accounting does not see memfd pages (good for the
+  commit limit, but `GlobalMemoryStatus`-style answers change); the title asks the runtime, not Wine.
+- **Windows build**: the bridge crate compiles to stubs there; CI must keep building it.
+- **Upstream merges**: xmem and watch change upstream often; keep the bridge behind the trait so
+  merges touch the Windows path only.
