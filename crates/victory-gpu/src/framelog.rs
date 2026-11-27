@@ -105,15 +105,56 @@ pub enum T {
     DiskReads,
     DiskBytes,
     DiskUs,
+    /// The memory watch's costs above taken on the frame's own threads
+    /// alone: those that prepared a submission, presented or submitted
+    /// ([`add`] marks them). What the frame waits for directly, against the
+    /// totals summed over every thread.
+    CritWatchNs,
+    CritProtectNs,
+    CritQueryNs,
+    CritGuardWaitNs,
+    CritLockWaitNs,
+    CritGuardFaults,
     Count,
 }
 
 const N: usize = T::Count as usize;
 static TOTAL: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 
-/// Adds to a total.
+thread_local! {
+    /// This thread is one of the frame's own ([`T::CritWatchNs`]).
+    static CRITICAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The frame's-threads twin of a memory-watch total.
+fn critical_twin(t: T) -> Option<T> {
+    Some(match t {
+        T::WatchNs => T::CritWatchNs,
+        T::ProtectNs => T::CritProtectNs,
+        T::QueryNs => T::CritQueryNs,
+        T::GuardWaitNs => T::CritGuardWaitNs,
+        T::WatchLockWaitNs => T::CritLockWaitNs,
+        T::GuardFaults => T::CritGuardFaults,
+        _ => return None,
+    })
+}
+
+/// Adds to a total. Adding to preparing, presenting or submitting marks the
+/// thread as one of the frame's own; the memory watch's costs on such a
+/// thread go to their twins too. (A const thread-local: no allocation, safe
+/// in the fault handler.)
 pub fn add(t: T, n: u64) {
     TOTAL[t as usize].fetch_add(n, Relaxed);
+    match t {
+        T::PrepareUs | T::PresentUs | T::ExecuteUs => CRITICAL.with(|c| c.set(true)),
+        _ => {
+            if let Some(twin) = critical_twin(t)
+                && CRITICAL.with(std::cell::Cell::get)
+            {
+                TOTAL[twin as usize].fetch_add(n, Relaxed);
+            }
+        }
+    }
 }
 
 /// Takes from a total (a time that was summed over threads is corrected to
@@ -438,7 +479,8 @@ fn text(f: &Frame) -> String {
          {:.0} mapping calls {:.1} ms; Windows calls {:.0} {:.1} ms; the GPU side told {:.0} {:.1} ms | memory watch, all \
          threads: {:.0} write-watch askings ({:.0} refused) {:.1} ms over {:.0} MB; {:.0} protection changes {:.1} ms; {:.0} \
          region queries {:.1} ms; waits for the guards {:.0} {:.1} ms, for its other locks {:.1} ms; {:.0} guard faults | \
-         pipelines: {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | pacing, all threads {:.1} ms | \
+         memory watch, the frame's threads: asking {:.1} ms, protecting {:.1} ms, querying {:.1} ms, guard-waiting {:.1} ms, \
+         lock-waiting {:.1} ms, {:.0} faults taken | pipelines: {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | pacing, all threads {:.1} ms | \
          process: {:.0} user {:.0} kernel ms, {:.0} page faults | {:.0} draws | {:.0} MB free",
         f.us / 1e3,
         (s(S_THREAD_USER) + s(S_THREAD_KERNEL)) / 1e3,
@@ -484,6 +526,12 @@ fn text(f: &Frame) -> String {
         ns_ms(T::GuardWaitNs),
         ns_ms(T::WatchLockWaitNs),
         t(T::GuardFaults),
+        ns_ms(T::CritWatchNs),
+        ns_ms(T::CritProtectNs),
+        ns_ms(T::CritQueryNs),
+        ns_ms(T::CritGuardWaitNs),
+        ns_ms(T::CritLockWaitNs),
+        t(T::CritGuardFaults),
         ms(T::PipelineWaitUs),
         t(T::DiskReads),
         t(T::DiskBytes) / 1e6,
@@ -790,6 +838,9 @@ mod tests {
         f.t[T::GuardWaits as usize] = 4.0;
         f.t[T::GuardWaitNs as usize] = 7_300_000.0;
         f.t[T::GuardFaults as usize] = 33.0;
+        f.t[T::CritWatchNs as usize] = 1_500_000.0;
+        f.t[T::CritGuardWaitNs as usize] = 2_200_000.0;
+        f.t[T::CritGuardFaults as usize] = 5.0;
         let line = text(&f);
         for want in [
             "remapping: 12 calls 45.6 ms",
@@ -799,9 +850,41 @@ mod tests {
             "50 region queries 1.0 ms",
             "waits for the guards 4 7.3 ms",
             "33 guard faults",
+            "memory watch, the frame's threads: asking 1.5 ms, protecting 0.0 ms, querying 0.0 ms, guard-waiting 2.2 ms",
+            "5 faults taken",
         ] {
             assert!(line.contains(want), "{want:?} not in {line}");
         }
+    }
+
+    /// Memory costs count as the frame's own only on threads that prepared,
+    /// presented or submitted.
+    #[test]
+    fn the_frames_threads_are_counted_apart() {
+        let crit = |t: T| TOTAL[t as usize].load(Relaxed);
+        let (q, g) = (crit(T::CritQueryNs), crit(T::CritGuardFaults));
+        std::thread::spawn(|| {
+            add(T::QueryNs, 5);
+            add(T::GuardFaults, 1);
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            (crit(T::CritQueryNs) - q, crit(T::CritGuardFaults) - g),
+            (0, 0)
+        );
+        std::thread::spawn(|| {
+            add(T::PrepareUs, 1);
+            add(T::QueryNs, 7);
+            add(T::GuardFaults, 2);
+            add(T::DiskReads, 1); // no twin
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            (crit(T::CritQueryNs) - q, crit(T::CritGuardFaults) - g),
+            (7, 2)
+        );
     }
 
     #[test]

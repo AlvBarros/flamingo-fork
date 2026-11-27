@@ -598,6 +598,10 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
 - 2026-11-27 (this session): **run announced** — `memory-bridge-foxhound` at 76498ca (WS8 frame
   log, `VICTORY_FRAME_LOG=1`, `VICTORY_BRIDGE` unset), `play.env` as committed, unattended
   (`FORK_KEYS`), up to 11 min, home `flamingo-fork-foxhound` (warm caches, as the 11:12 run).
+  Done 13:24-13:35, no crash (`logs/20261127-132421-play.log`).
+- 2026-11-27 (this session): **run announced** — the same, plus the frame log's split of the
+  memory watch's costs on the frame's own threads (preparing, presenting, submitting), to measure
+  what the bridge could take off the frame's critical path.
 
 ### Re-scope
 
