@@ -89,3 +89,6 @@ Thumbs.db
 # Linux fork: the memory bridge's build outputs (bridge/pe/build.sh writes them under target/)
 *.so
 *.o
+
+# Python bytecode (the Linux scripts)
+__pycache__/
