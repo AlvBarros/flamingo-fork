@@ -19,7 +19,7 @@
 # crashes, frame times per minute, the longest frames with what they were made
 # of and the note before them, the frames after each note, and GPU and memory
 # peaks. Needs VICTORY_FRAME_LOG=1 (play.local.env sets it).
-set -u
+# (No `set -u`: env.sh relies on unset variables.)
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$ROOT"
 MIN=${1:-15}
