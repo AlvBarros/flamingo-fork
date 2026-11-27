@@ -81,3 +81,7 @@ Thumbs.db
 /nvidia-sdk/
 # What the F1 menu saved
 /victory-settings.txt
+
+# Linux fork: run logs and local settings
+/logs/
+/scripts/linux/play.local.env
