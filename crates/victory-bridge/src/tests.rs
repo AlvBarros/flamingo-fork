@@ -115,11 +115,15 @@ fn protections_convert_both_ways() {
     assert_eq!(Prot(abi::PROT_WRITE).to_page(), 0x04);
 }
 
-/// With no DLL (tests never have one beside them) everything says "not
+/// With no DLL (unless test.sh put one beside the test) everything says "not
 /// mine", whatever VICTORY_BRIDGE is: the present path stays in charge.
 #[test]
 fn without_the_dll_nothing_is_bridged() {
-    assert!(!available());
+    // With VICTORY_BRIDGE=1 and the DLL beside the test (test.sh,
+    // FORK_BRIDGE_DIR) the bridge is real: nothing to check here then.
+    if available() {
+        return;
+    }
     assert!(!bridged(W));
     assert!(Pool::create(1 << 20).is_none());
     assert!(!window_add(W, K64));
