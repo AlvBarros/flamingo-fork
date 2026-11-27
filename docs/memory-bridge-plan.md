@@ -281,4 +281,51 @@ before they start and never overlap (spikes use their own throwaway Wine prefixe
 
 ### S4 results
 
-(pending)
+Branch `memory-bridge-s4`, code in `tools/bridge-spike/s4/` (README has the full table and the
+commands). Measured 2026-11-27 on this PC (i5-14400F, P-cores, kernel 6.18) under Proton
+Experimental, from PE code, in a throwaway prefix. Four full runs plus three no-op-only runs; the
+ranges cover the runs. 64 KiB views of one memfd in a `VirtualAlloc(MEM_RESERVE)` window. The
+Wine path ran in the same session.
+
+| Per op | 0 views | 60,000 views |
+|---|---|---|
+| No-op `__wine_unix_call`, 1 thread (tight loop) | 4.7 ns | |
+| same, 4 / 8 threads calling at once | 5.3 / 6.5-8.4 ns | |
+| Bridge map + unmap, 1 op per call | 1.59-1.77 µs | 1.75-1.88 µs |
+| Bridge map + unmap, batches of 8 to 2048 | 1.42-1.62 µs | 1.61-1.82 µs |
+| Bridge replace in place (`MAP_FIXED` over a view), any batch size | 0.79-1.12 µs | 0.95-1.07 µs |
+| Bridge `mprotect`, 1 per call / batched | 222-246 / 192-219 ns | 220-241 / 192-222 ns |
+| Per-op result array written back | no measurable cost (±5%, both ways) | same |
+| Bridge map + unmap, 1 / 2 / 4 / 8 threads mapping at once (wall time per pair) | 1.5 / 2.2 / 2.4 / 2.8 µs | 1.6 / 2.1 / 2.3 / 2.8 µs |
+| Wine `VirtualFree(MEM_PRESERVE_PLACEHOLDER)` split, median | 1.2 µs | 1.3-1.5 µs |
+| Wine `MapViewOfFile3` + `UnmapViewOfFile2` | 15-16 µs | 300-590 µs |
+| Wine `VirtualProtect`, no other thread busy | 0.56-0.58 µs | 0.57-0.65 µs |
+
+Findings: a unix call costs about 5 ns. That is about 1/200 of one `mmap`, and it does not grow
+with concurrent callers. Batching saves at most about 0.1 µs per op, and nothing beyond 8 ops per
+call. Several threads mapping at once lower total throughput (the kernel's `mmap_lock`). At
+60,000 views the bridge is 180-340 times faster than Wine's path. A view replaced in place costs
+about 60% of an unmap followed by a map. Loading needs `WINEDLLPATH` naming the DLL's directory:
+without it Wine loads the DLL as builtin, but `MemoryWineUnixFuncs` finds no Unix half. This also
+applies to the parent spike's `load.exe`.
+
+**Decides (WS0):**
+- *Batch layout:* one op is 32 bytes: `{ addr: u64, len: u64, offset: u64 /* in the pool */,
+  prot: u32 /* PROT_READ|PROT_WRITE bits */, kind: u32 /* MAP=0, UNMAP=1, PROTECT=2 */ }`. Ops of
+  different kinds can mix in one batch. The header is 32 bytes: `{ ops: u64 /* *const Op */,
+  results: u64 /* *mut i32, errno per op, or 0 */, count: u32, done: u32 /* out */, pool: i32,
+  error: i32 /* out: errno of the first failure */ }`. Without `results` the Unix half stops at
+  the first failure (`done`, `error`). With it, every op runs and gets its own errno. The Unix
+  half checks every op against the window it was given at pool creation.
+- *MAP means `MAP_FIXED` over whatever is there.* xmem's `had` + slice (unmap, then map the page
+  again) becomes one MAP op, not UNMAP + MAP. Placeholder splits disappear entirely.
+- *Batch size:* the size makes no difference to speed, so batch by structure: **one bridge call
+  per `change` call** (typically up to ~2,100 ops per frame), one per `map`/`unmap`/alias
+  operation, one per protect list. Cap a call at 4,096 ops (about 4 ms) and split longer lists
+  into several calls. That cap only bounds latency; no minimum batch is needed. Single-op calls
+  are fine for the rare paths, such as the title's own `VirtualProtect`.
+- *Threads:* do the bridge batch on the calling thread. Do not hand it to `change`'s worker pool:
+  extra threads cost throughput. `VICTORY_MAP_THREADS` stops mattering on the bridge path.
+- *Per-op result reporting:* it costs nothing measurable, so keep it in the ABI. xmem's `change`
+  passes `results`, which keeps the per-op `done` it uses today to decide what to note. Other
+  callers pass 0 and read `done`/`error`.
