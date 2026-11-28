@@ -174,6 +174,13 @@ static void probe(void)
     self = getpid();
     if (process_vm_readv(self, &to, 1, &from, 1, 0) == 1 && got == 1) features |= VB_FEATURE_COPY;
 
+    /* VICTORY_BRIDGE_WATCH=0: no write tracking (userfaultfd), as on a kernel without it; to find
+     * which piece of the bridge NVIDIA's driver objects to (docs/memory-bridge-plan.md §11). */
+    {
+        const char *w = getenv("VICTORY_BRIDGE_WATCH");
+        if (w && w[0] == '0') return;
+    }
+
     /* UFFDIO_API may be called once per fd: ask what exists on one, enable on a fresh one. */
     probe_fd = uffd_open();
     if (probe_fd < 0) return;

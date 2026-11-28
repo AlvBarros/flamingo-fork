@@ -685,6 +685,23 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
   fault comes *during* the device's destruction (17.465 s, between 17.345 and 17.478), so it is
   work on a queue that is not ours (vkd3d's or the swap chain's) and harmless by itself; what made
   the teardown hang is the inconsistent mapping record above. No lockup in any of the four runs.
+- 2026-11-27, first steps of the hunt for the driver errors:
+  - Ruled out: **holes in the address space.** The bridge's UNMAP puts PROT_NONE anonymous memory
+    back (`unmap_range`), and windows are reserved through Wine first, so the kernel never hands a
+    window address to the driver's own mmaps.
+  - Ruled out: **title memory opened as a GPU heap.** `VICTORY_INPLACE` and
+    `VICTORY_PORT_CONSTANTS` are off, and the bridge-on log has no in-place heaps.
+  - Ruled out as the only cause: **write tracking.** A new switch,
+    `VICTORY_BRIDGE_WATCH=0` (Unix half: no userfaultfd, as on a kernel without it), ran 7 min
+    with the bridge on (`logs/ab-bridge/bridge1-nowatch`). It still logged
+    `dmaAllocMapping_GM107: can't update VA space for mapping @vaddr=0x537200000` (4 min in), but
+    no `intermapRegisterDmaMapping` failure this time.
+  - Left: **the pool itself** (memfd views, MAP_FIXED, mprotect) and **memory pressure.** With the
+    bridge, +2.2 GB in use; the log says 9.8 GB free of 32. The 2026-11-26 occurrences without the
+    bridge argue for pressure, or for another trigger shared with it.
+  - Next run: the bridge on and the RAM made smaller (fewer streamed textures, or a lower
+    `VICTORY_TEXTURE_ROOM_PERCENT`), and a bridge-off run under the same memory load (a memory
+    hog), to separate the pool from the pressure.
 
 ### Re-scope
 
