@@ -637,6 +637,54 @@ Parallel agents work on `memory-bridge-foxhound-<ws>` and append their own subse
   end a run with `scripts/linux/stop-game.sh`, never `wineserver -k` or `kill -9` first.** Not
   covered: a hung card (the deadline passes and the process ends anyway) and the title's CRT
   `exit` (`victory-loader` `detach_all`, not seen in GTA VI runs).
+- 2026-11-27 20:59-21:32, **the bridge off/on A/B, done properly** (this folder, prefix
+  `flamingo-fork-foxhound`, `VICTORY_BRIDGE` set in the environment and checked in each log header:
+  `0 (environment)` / `1 (environment)`; 10 min each, unattended with FORK_KEYS, both ended with
+  `scripts/linux/stop-game.sh`; logs `20261127-205903-play.log` (off), `20261127-212145-play.log`
+  (on); kept in `logs/ab-bridge/`). `ab_runs.py`, 60-480 s, >= 1000 draws a frame:
+
+  | | bridge off | bridge on | on vs off |
+  |---|---|---|---|
+  | frames | 7486 | 7599 | +2% |
+  | mean / median ms | 57 / 49 | 56 / 54 | -2% / +10% |
+  | p90 / p99 ms | 76 / 204 | 73 / 113 | -4% / **-45%** |
+  | max ms | 490 | 578 | +18% |
+  | frames over 250 ms | 0.4% | 0.1% | **-72%** |
+  | long frames / time in them | 293 / 10.8% | 102 / 3.5% | **-65% / -67%** |
+  | region queries ms (usual frame) | 38.3 | 0.1 | -100% |
+  | Windows mapping calls ms | 7.2 | 0 | -100% |
+  | xmem ms / remap ms | 8.5 / 8.1 | 1.3 / 1.2 | -85% / -86% |
+  | guard wait ms | 43.9 | 70.4 | +60% (WS5) |
+  | system memory in use, median / max | 19.8 / 20.3 GB | 22.0 / 23.8 GB | **+2.2 / +3.5 GB** |
+
+  **Performance: the bridge works** as designed: the Wine memory costs it targets are gone and
+  stutter falls by two thirds; the usual frame is not faster (median +10%: guard waits up, WS5),
+  and it costs about 2-3.5 GB more RAM (the RAM question from the user's session: answered, more).
+
+  **Safety: the bridge is not safe to ship.** In the bridge-on run NVIDIA's driver logged, *during
+  play* (21:24:45, 21:27:28): `dmaAllocMapping_GM107: can't update VA space for mapping`,
+  `intermapRegisterDmaMapping: Failed to insert new mapping node for range 0xDE7A1B0000-0xDE7A1BFFFF`
+  and assertions in `gpu_vaspace.c`. None of the three bridge-off runs today logged anything like
+  it. On the boot that froze, the same `intermapRegisterDmaMapping` failure came at 18:50:47, in the
+  bridge run, 7 minutes before the lockup, and the lockup was in the same structure's teardown
+  (`intermapDelDmaMapping -> btreeUnlink`). Reading: with the bridge the driver's record of DMA
+  mappings goes inconsistent during play; teardown of an inconsistent record can spin forever.
+  (The same insert failure also appears on 2026-11-26 11:12, before the foxhound bridge: whatever
+  ran then, maybe an in-place or spike experiment, is worth knowing, as a second trigger.) The address
+  0xDE7A1B0000 is not in the game log. **Next for the bridge (before anything else):** find what the
+  driver maps at the failing range (a 64 KiB granule: a bridge view? a vkd3d host-visible
+  allocation? record the bridge's MAP ops with addresses and compare), and whether memfd views,
+  userfaultfd WP-async or mprotect on pages the driver has pinned cause it; reproduce with
+  the bridge's pieces turned on one at a time (pool only; + uffd; + mprotect).
+
+  **Exit, re-measured with these runs.** `Xid 31` at the end of a run is near-universal on this
+  base (31 times on 2026-11-27 before the freeze, all at run ends), always at the same GPU address
+  (`0x5_8d249000`), and stays with the orderly end: drained queues (idle in 12-33 ms), new
+  submissions and presents dropped (`drain::execute`, `drain::ending`), and the D3D12 device
+  destroyed before the process ends (`VICTORY_END_RELEASE`, on; ~49,000 references, 132 ms). The
+  fault comes *during* the device's destruction (17.465 s, between 17.345 and 17.478), so it is
+  work on a queue that is not ours (vkd3d's or the swap chain's) and harmless by itself; what made
+  the teardown hang is the inconsistent mapping record above. No lockup in any of the four runs.
 
 ### Re-scope
 

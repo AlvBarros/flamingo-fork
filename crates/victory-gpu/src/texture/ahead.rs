@@ -274,7 +274,7 @@ impl Worker {
                 job.record(&self.list);
             }
             self.list.Close()?;
-            self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
+            crate::drain::execute(&self.queue, &[Some(self.list.cast()?)]);
             self.queue.Signal(&self.fence, value)?;
             // (Without an event: this waits.)
             self.fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())?;

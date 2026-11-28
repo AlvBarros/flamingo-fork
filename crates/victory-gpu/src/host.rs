@@ -307,7 +307,7 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
             });
         }
         let Some(a) = aside.as_mut() else { return Ok(()) };
-        a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
+        crate::drain::execute(&a.queue, &[Some(a.list.clone())]);
         a.value += 1;
         a.queue.Signal(&a.fence, a.value)?;
         if a.fence.GetCompletedValue() < a.value {
@@ -4567,7 +4567,7 @@ impl Host {
                         }
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    crate::drain::execute(&self.queue, &[Some(list.cast()?)]);
                     Ok(())
                 })()
             };
@@ -4922,7 +4922,7 @@ impl Host {
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
                 if let Some(queue) = &copy_queue {
-                    queue.ExecuteCommandLists(&lists);
+                    crate::drain::execute(&queue, &lists);
                     queue.Signal(&fence, sent)?;
                     meanwhile();
                     fence.SetEventOnCompletion(sent, event)?;
@@ -4934,7 +4934,7 @@ impl Host {
                 // In the order of the queue: the sends of title bytes so
                 // far are ahead of this fetch, every later one behind it.
                 let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
-                self.queue.ExecuteCommandLists(&lists);
+                crate::drain::execute(&self.queue, &lists);
                 let after = *order;
                 drop(order);
                 self.card_sent();
@@ -5228,7 +5228,7 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
-                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    crate::drain::execute(&self.queue, &[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
                     self.queue.Signal(&self.fence, *submitted)?;
@@ -5927,7 +5927,7 @@ impl Host {
             let signalled = unsafe {
                 let mut from = 0;
                 for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
+                    crate::drain::execute(&self.queue, &lists[from..to]);
                     from = to;
                 }
                 self.queue.Signal(&self.fence, *submitted)
@@ -5982,7 +5982,7 @@ impl Host {
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
-                self.queue.ExecuteCommandLists(group);
+                crate::drain::execute(&self.queue, group);
                 self.card_sent();
                 let waited = self
                     .queue
@@ -10052,7 +10052,10 @@ impl Host {
                 },
             );
             let called = crate::streamline::present_called(&presenting);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // Not once the process is ending (`crate::drain`): a present is card work too.
+            if !crate::drain::ending() {
+                let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            }
             crate::streamline::present_returned(called);
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
